@@ -1,8 +1,11 @@
 import os
 import re
 import logging
+import hashlib
+import json
 from typing import List, Dict, Any
 from datetime import datetime
+from collections import Counter
 
 from volatility3.framework import renderers, interfaces, automagic, plugins, exceptions
 from volatility3.framework.configuration import requirements
@@ -59,37 +62,56 @@ def check_if_all_elements_are_equal(elements: List[Any]) -> bool:
 
 
 class Page:
-    def __init__(self, virtual_address: int, size: int, pfn_db_entry_prototype_pte_flag: str):
+    def __init__(self, virtual_address: int, size: int, pfn_db_entry_prototype_pte_flag: str, module_filename: str,
+                 contents_digest: str = None):
         self.virtual_address: int = virtual_address
         self.size: int = size
         # pfn_db_entry_prototype_pte_flag can be 'True', 'False', or 'Undetermined'
         self.pfn_db_entry_prototype_pte_flag: str = pfn_db_entry_prototype_pte_flag
+        self.module_filename: str = module_filename  # Filename of the dumped module where the page is
+        # Regarding the digest of the page contents:
+        # - For shared pages: SHA-256 digest
+        # - For pages considered private: TLSH digest
+        self.contents_digest: str = contents_digest
 
-    def get_all_information(self):
+    def get_basic_information(self):
         return {'virtual_address': hex(self.virtual_address), 'size': hex(self.size),
                 'pfn_db_entry_prototype_pte_flag': self.pfn_db_entry_prototype_pte_flag}
 
+    def is_shared(self):
+        return True if self.pfn_db_entry_prototype_pte_flag == 'True' else False
+
+    def is_private(self):
+        return True if self.pfn_db_entry_prototype_pte_flag == 'False' else False
+
+    def is_pfn_db_entry_prototype_pte_flag_undetermined(self):
+        return True if self.pfn_db_entry_prototype_pte_flag == 'Undetermined' else False
+
+    def is_considered_private(self):
+        # If it is not clear that a page is shared, it is considered private
+        return True if self.is_private() or self.is_pfn_db_entry_prototype_pte_flag_undetermined() else False
+
 
 class Module:
-    def __init__(self, name: str, path: str, base_address: int, size: int, process_id: int, dumped_filename: str,
+    def __init__(self, name: str, path: str, base_address: int, size: int, process_id: int, filename: str,
                  pages: List[Page]):
         self.name: str = name
         self.path: str = path
         self.base_address: int = base_address  # Virtual base address
         self.size: int = size  # Size in bytes
         self.process_id: int = process_id  # Identifier of the process where the module is mapped
-        self.dumped_filename: str = dumped_filename  # Filename of the dumped module
+        self.filename: str = filename  # Filename of the dumped module
         self.pages: List[Page] = pages
 
     def get_basic_information(self):
         return {'name': self.name, 'path': self.path, 'base_address': hex(self.base_address), 'size': hex(self.size),
-                'process_id': self.process_id, 'dumped_filename': self.dumped_filename,
+                'process_id': self.process_id, 'filename': self.filename,
                 'number_of_retrieved_pages': len(self.pages)}
 
 
 def delete_dmp_files(modules: List[Module]) -> None:
     for module in modules:
-        os.remove(module.dumped_filename)
+        os.remove(module.filename)
 
 
 def delete_modules_under_syswow64(modules: List[Module], logger) -> List[Module]:
@@ -102,7 +124,7 @@ def delete_modules_under_syswow64(modules: List[Module], logger) -> List[Module]
             modules_not_under_syswow64.append(module)
         else:
             modules_under_syswow64.append(module)
-            logger.info(f'\nModule under {syswow64_directory} identified: {module.path}')
+            logger.info(f'\nModule under C:\\Windows\\SysWOW64 identified: {module.path}')
     delete_dmp_files(modules_under_syswow64)
     return modules_not_under_syswow64
 
@@ -118,7 +140,7 @@ def check_if_modules_can_be_mixed(modules: List[Module], logger) -> bool:
     for module in modules:
         paths.append(module.path.casefold())
         sizes.append(module.size)
-        sizes.append(os.path.getsize(module.dumped_filename))
+        sizes.append(os.path.getsize(module.filename))
         base_addresses.append(module.base_address)
 
     are_all_paths_equal: bool = check_if_all_elements_are_equal(paths)
@@ -133,6 +155,124 @@ def check_if_modules_can_be_mixed(modules: List[Module], logger) -> bool:
     else:
         logger.info('\nThe modules can be mixed')
         return True
+
+
+def get_shared_pages(pages: List[Page]) -> List[Page]:
+    shared_pages: List[Page] = []
+    for page in pages:
+        if page.is_shared():
+            shared_pages.append(page)
+    return shared_pages
+
+
+def count_instances_of_each_element(elements: List[Any]) -> Dict[Any, int]:
+    """Count how many times each element is present in a list."""
+    return dict(Counter(elements))
+
+
+def get_page_from_dumped_module(module_filename: str, page_offset: int, page_size: int) -> bytes:
+    with open(module_filename, mode='rb') as dumped_module:
+        dumped_module.seek(page_offset)
+        page_contents = dumped_module.read(page_size)
+        return page_contents
+
+
+def create_entry_for_page_in_mixed_module_metadata(page_offset: int, page_size: int, is_page_shared: bool,
+                                                   page_contents_sha_256_digest: str) -> Dict[str, Any]:
+    return {'offset': page_offset, 'size': page_size, 'is_shared': is_page_shared,
+            'sha_256_digest': page_contents_sha_256_digest}
+
+
+def get_most_common_element(elements: List[Any]) -> Any:
+    return max(set(elements), key=elements.count)
+
+
+def find_page_with_certain_digest(pages: List[Page], digest: str) -> Page:
+    for page in pages:
+        if page.contents_digest == digest:
+            return page
+
+
+def insert_page_into_mixed_module(page: Page, module_base_address: int, mixed_module: bytearray,
+                                  mixed_module_metadata: List[Dict[str, Any]]) -> None:
+    page_offset: int = page.virtual_address - module_base_address  # Offset of the page inside the module
+    page_contents: bytes = get_page_from_dumped_module(page.module_filename, page_offset, page.size)
+    mixed_module[page_offset: page_offset + page.size] = page_contents
+    mixed_module_metadata.append(
+        create_entry_for_page_in_mixed_module_metadata(page_offset, page.size, page.is_shared(), page.contents_digest))
+
+
+def mix_modules(modules: List[Module], mixed_module_filename: str, mixed_module_metadata_filename: str, logger) -> None:
+    if not modules:
+        return
+    module_size: int = modules[0].size
+    module_base_address: int = modules[0].base_address
+    mixed_module: bytearray = bytearray(module_size)  # The mixed module is initialized with zeros
+    mixed_module_metadata: List[Dict[str, Any]] = []
+
+    # In the mixture dictionary:
+    # - The keys are virtual addresses (the virtual address acts here as an id for a page inside a module)
+    # - The values are lists of pages that all start at the same virtual address
+
+    # In the mixture_shared_state dictionary:
+    # - The idea for the keys is the same as in the mixture dictionary
+    # - Each value is a boolean indicating if the page with that virtual address will be marked as shared (True) or not (False) in the mixed module
+
+    mixture: Dict[int, List[Page]] = {}
+    mixture_shared_state: Dict[int, bool] = {}
+    for module in modules:
+        for page in module.pages:
+            if page.virtual_address not in mixture.keys():
+                mixture[page.virtual_address] = [page]
+                mixture_shared_state[page.virtual_address] = False
+            else:
+                mixture[page.virtual_address].append(page)
+
+    for virtual_address in mixture.keys():
+        shared_pages: List[Page] = get_shared_pages(mixture[virtual_address])
+        if shared_pages:
+            mixture[virtual_address] = shared_pages
+            mixture_shared_state[virtual_address] = True
+            for page in mixture[virtual_address]:
+                page_offset_inside_module: int = page.virtual_address - module_base_address
+                page_contents = get_page_from_dumped_module(page.module_filename, page_offset_inside_module, page.size)
+                page.contents_digest = hashlib.sha256(page_contents).hexdigest()
+
+    # Check the contents that shared pages with the same virtual address have, and write to the mixed module accordingly
+    logger.info(f'\nResults after comparing the contents of the shared pages:')
+    for virtual_address in mixture.keys():
+        if mixture_shared_state[virtual_address]:
+            page_digests = []
+            for page in mixture[virtual_address]:
+                page_digests.append(page.contents_digest)
+            are_all_shared_pages_equal: bool = check_if_all_elements_are_equal(page_digests)
+            if are_all_shared_pages_equal:
+                # All the shared pages have the same contents, it does not matter which one is picked
+                shared_page: Page = mixture[virtual_address][0]
+                insert_page_into_mixed_module(shared_page, module_base_address, mixed_module, mixed_module_metadata)
+                logger.info(
+                    f'\tAll the shared pages whose virtual address is {hex(virtual_address)} ({len(mixture[virtual_address])}) are equal (SHA-256 digest: {shared_page.contents_digest})')
+            else:
+                most_common_page_digest: str = get_most_common_element(page_digests)
+                # Find a page with that digest, it does not matter which one is picked as long as its digest matches with the most common one
+                most_common_shared_page: Page = find_page_with_certain_digest(mixture[virtual_address],
+                                                                              most_common_page_digest)
+                insert_page_into_mixed_module(most_common_shared_page, module_base_address, mixed_module,
+                                              mixed_module_metadata)
+                logger.info(
+                    f'\tAll the shared pages whose virtual address is {hex(virtual_address)} ({len(mixture[virtual_address])}) are not equal, here is how many times each SHA-256 digest is present:')
+                instances_of_each_page_digest: Dict[str, int] = count_instances_of_each_element(page_digests)
+                for page_digest in instances_of_each_page_digest.keys():
+                    logger.info(f'\t\t{page_digest}: {instances_of_each_page_digest[page_digest]}')
+        else:
+            # To do: Pages that are considered private
+            pass
+
+    with open(mixed_module_filename, mode='wb') as dumped_mixed_module:
+        dumped_mixed_module.write(mixed_module)
+
+    with open(mixed_module_metadata_filename, 'w') as mixed_module_metadata_file:
+        json.dump(mixed_module_metadata, mixed_module_metadata_file, ensure_ascii=False, indent=4)
 
 
 class Modex(interfaces.plugins.PluginInterface):
@@ -226,6 +366,11 @@ class Modex(interfaces.plugins.PluginInterface):
         # The modules under C:\Windows\SysWOW64 are not taken into account
         modules_to_mix = delete_modules_under_syswow64(modules_to_mix, logger)
 
+        if not modules_to_mix:
+            logger.info(
+                '\nAll the identified modules are under the C:\\Windows\\SysWOW64 directory, as a result, they cannot be mixed')
+            return renderers.TreeGrid([("Filename", str)], self._generator(files_finally_generated))
+
         # Make sure that the modules can be mixed
         can_modules_be_mixed: bool = check_if_modules_can_be_mixed(modules_to_mix, logger)
         if not can_modules_be_mixed:
@@ -246,7 +391,8 @@ class Modex(interfaces.plugins.PluginInterface):
                 page_pfn_db_entry_prototype_pte_flag = relevant_page_details['pfn_db_entry_prototype_pte_flag']
                 if None not in (page_virtual_address, page_size, page_pfn_db_entry_prototype_pte_flag):
                     module_to_mix.pages.append(
-                        Page(int(page_virtual_address, 16), int(page_size, 16), page_pfn_db_entry_prototype_pte_flag))
+                        Page(int(page_virtual_address, 16), int(page_size, 16), page_pfn_db_entry_prototype_pte_flag,
+                             module_to_mix.filename))
 
         # Check if the last page retrieved for each module is out of bounds
         for module_to_mix in modules_to_mix:
@@ -258,7 +404,16 @@ class Modex(interfaces.plugins.PluginInterface):
         for module_to_mix in modules_to_mix:
             logger.info(f'\t{module_to_mix.get_basic_information()}')
             for page in module_to_mix.pages:
-                logger.info(f'\t\t{page.get_all_information()}')
+                logger.info(f'\t\t{page.get_basic_information()}')
+
+        mixed_module_filename: str = f'{module_supplied.lower()}.dmp'
+        mixed_module_metadata_filename: str = f'{module_supplied.lower()}.description.json'
+
+        # Perform the mixture
+        mix_modules(modules_to_mix, mixed_module_filename, mixed_module_metadata_filename, logger)
+
+        files_finally_generated.append(mixed_module_filename)
+        files_finally_generated.append(mixed_module_metadata_filename)
 
         # Delete the .dmp files that were used to create the final .dmp file
         delete_dmp_files(modules_to_mix)
