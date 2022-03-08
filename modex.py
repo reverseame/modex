@@ -3,9 +3,11 @@ import re
 import logging
 import hashlib
 import json
+import tlsh
 from typing import List, Dict, Any
 from datetime import datetime
 from collections import Counter
+from tabulate import tabulate
 
 from volatility3.framework import renderers, interfaces, automagic, plugins, exceptions
 from volatility3.framework.configuration import requirements
@@ -71,7 +73,7 @@ class Page:
         self.module_filename: str = module_filename  # Filename of the dumped module where the page is
         # Regarding the digest of the page contents:
         # - For shared pages: SHA-256 digest
-        # - For pages considered private: TLSH digest
+        # - For pages considered private: TLSH digests will be used to choose a representative page. However, SHA-256 digests will be used in the metadata file.
         self.contents_digest: str = contents_digest
 
     def get_basic_information(self):
@@ -202,6 +204,59 @@ def insert_page_into_mixed_module(page: Page, module_base_address: int, mixed_mo
         create_entry_for_page_in_mixed_module_metadata(page_offset, page.size, page.is_shared(), page.contents_digest))
 
 
+def calculate_page_digests(pages: List[Page], module_base_address: int, use_similarity_digest_algorithm: bool) -> None:
+    for page in pages:
+        page_offset_inside_module: int = page.virtual_address - module_base_address
+        page_contents: bytes = get_page_from_dumped_module(page.module_filename, page_offset_inside_module,
+                                                           page.size)
+        if use_similarity_digest_algorithm:
+            page.contents_digest = tlsh.hash(page_contents)
+        else:
+            page.contents_digest = hashlib.sha256(page_contents).hexdigest()
+
+
+def get_page_digests(pages: List[Page]) -> List[str]:
+    page_digests: List[str] = []
+    for page in pages:
+        page_digests.append(page.contents_digest)
+    return page_digests
+
+
+def choose_representative_page_digest(page_similarity_digests: List[str], logger) -> str:
+    """Compare all the page similarity digests received and choose one that is representative."""
+    # similarity_scores_table is a table with the similarity scores obtained after comparing all the similarity digests between each other
+    similarity_scores_table: List[List[int]] = []
+    for page_similarity_digest_i in page_similarity_digests:
+        similarity_scores_row: List[int] = []
+        for page_similarity_digest_j in page_similarity_digests:
+            similarity_scores_row.append(tlsh.diff(page_similarity_digest_i, page_similarity_digest_j))
+        similarity_scores_table.append(similarity_scores_row)
+
+    sums_of_individual_similarity_scores_rows: List[int] = []
+    for similarity_scores_row in similarity_scores_table:
+        sums_of_individual_similarity_scores_rows.append(sum(similarity_scores_row))
+    minimum_sum: int = min(sums_of_individual_similarity_scores_rows)
+    index_of_minimum_sum: int = sums_of_individual_similarity_scores_rows.index(minimum_sum)
+    representative_page_digest: str = page_similarity_digests[index_of_minimum_sum]
+
+    # Log the process
+    table_for_log: List[List[str]] = [[''] + page_similarity_digests]
+    for page_similarity_digest in page_similarity_digests:
+        table_for_log.append([page_similarity_digest])
+    current_index_in_table_for_log: int = 1
+    for similarity_scores_row in similarity_scores_table:
+        for similarity_score in similarity_scores_row:
+            table_for_log[current_index_in_table_for_log].append(str(similarity_score))
+        current_index_in_table_for_log += 1
+
+    logger.info('\t\tSimilarity scores table:')
+    logger.info(tabulate(table_for_log, tablefmt='grid'))
+    logger.info(
+        f'\t\tThe minimum sum ({minimum_sum}) is in the row that corresponds to the digest {page_similarity_digests[index_of_minimum_sum]}')
+
+    return representative_page_digest
+
+
 def mix_modules(modules: List[Module], mixed_module_filename: str, mixed_module_metadata_filename: str, logger) -> None:
     if not modules:
         return
@@ -233,40 +288,47 @@ def mix_modules(modules: List[Module], mixed_module_filename: str, mixed_module_
         if shared_pages:
             mixture[virtual_address] = shared_pages
             mixture_shared_state[virtual_address] = True
-            for page in mixture[virtual_address]:
-                page_offset_inside_module: int = page.virtual_address - module_base_address
-                page_contents = get_page_from_dumped_module(page.module_filename, page_offset_inside_module, page.size)
-                page.contents_digest = hashlib.sha256(page_contents).hexdigest()
+            calculate_page_digests(mixture[virtual_address], module_base_address, False)
+        else:
+            calculate_page_digests(mixture[virtual_address], module_base_address, True)
 
-    # Check the contents that shared pages with the same virtual address have, and write to the mixed module accordingly
-    logger.info(f'\nResults after comparing the contents of the shared pages:')
+    logger.info(f'\nResults after choosing a page for each available virtual address:')
     for virtual_address in mixture.keys():
         if mixture_shared_state[virtual_address]:
-            page_digests = []
-            for page in mixture[virtual_address]:
-                page_digests.append(page.contents_digest)
+            # Check the contents that a list of shared pages with the same virtual address have, and write to the mixed module accordingly
+            page_digests: List[str] = get_page_digests(mixture[virtual_address])  # SHA-256 digests
             are_all_shared_pages_equal: bool = check_if_all_elements_are_equal(page_digests)
             if are_all_shared_pages_equal:
                 # All the shared pages have the same contents, it does not matter which one is picked
                 shared_page: Page = mixture[virtual_address][0]
                 insert_page_into_mixed_module(shared_page, module_base_address, mixed_module, mixed_module_metadata)
                 logger.info(
-                    f'\tAll the shared pages whose virtual address is {hex(virtual_address)} ({len(mixture[virtual_address])}) are equal (SHA-256 digest: {shared_page.contents_digest})')
+                    f'\tAll the shared pages whose virtual address is {hex(virtual_address)} ({len(mixture[virtual_address])}) (offset {virtual_address - module_base_address}) are equal (SHA-256 digest: {shared_page.contents_digest})')
             else:
                 most_common_page_digest: str = get_most_common_element(page_digests)
-                # Find a page with that digest, it does not matter which one is picked as long as its digest matches with the most common one
+                # Find a page with the most common digest, it does not matter which page is picked as long as its digest matches with the most common one
                 most_common_shared_page: Page = find_page_with_certain_digest(mixture[virtual_address],
                                                                               most_common_page_digest)
                 insert_page_into_mixed_module(most_common_shared_page, module_base_address, mixed_module,
                                               mixed_module_metadata)
                 logger.info(
-                    f'\tAll the shared pages whose virtual address is {hex(virtual_address)} ({len(mixture[virtual_address])}) are not equal, here is how many times each SHA-256 digest is present:')
+                    f'\tAll the shared pages whose virtual address is {hex(virtual_address)} ({len(mixture[virtual_address])}) (offset {virtual_address - module_base_address}) are not equal, here is how many times each SHA-256 digest is present:')
                 instances_of_each_page_digest: Dict[str, int] = count_instances_of_each_element(page_digests)
                 for page_digest in instances_of_each_page_digest.keys():
                     logger.info(f'\t\t{page_digest}: {instances_of_each_page_digest[page_digest]}')
         else:
-            # To do: Pages that are considered private
-            pass
+            # In this case, no shared pages were found that started with the current virtual address.
+            # As a result, a representative page has to be chosen to be inserted in the mixed module.
+            logger.info(
+                f'\tNo shared pages were found that started with the virtual address {hex(virtual_address)} (offset {virtual_address - module_base_address}). As a result, a representative page of the total {len(mixture[virtual_address])} pages has to be chosen. Below is the process followed to choose the representative page:')
+            page_similarity_digests: List[str] = get_page_digests(mixture[virtual_address])  # TLSH digests
+            representative_page_digest: str = choose_representative_page_digest(page_similarity_digests, logger)
+            representative_page: Page = find_page_with_certain_digest(mixture[virtual_address],
+                                                                      representative_page_digest)
+            calculate_page_digests([representative_page], module_base_address,
+                                   False)  # Calculate the SHA-256 digest of the representative page
+            insert_page_into_mixed_module(representative_page, module_base_address, mixed_module,
+                                          mixed_module_metadata)
 
     with open(mixed_module_filename, mode='wb') as dumped_mixed_module:
         dumped_mixed_module.write(mixed_module)
