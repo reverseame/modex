@@ -22,12 +22,20 @@ def validate_modex_output(module_path: str, metadata_path: str) -> None:
     is_modex_output_correct: bool = True
 
     with open(metadata_path) as metadata_file:
-        # Each element in the metadata list contains information about one page
-        metadata: List[Dict[str, Any]] = json.load(metadata_file)
+        metadata: Dict[str, Any] = json.load(metadata_file)
 
     # Validate that each page listed in the metadata is in the module
     logger.info(f'Check that the extracted module and the information in the metadata match:')
-    for page in metadata:
+    dumped_module_size: int = os.path.getsize(module_path)
+    module_size_in_metadata: int = metadata['statistics']['module_size']
+    if dumped_module_size == module_size_in_metadata:
+        logger.info(f'\tThe module size has been correctly validated')
+    else:
+        is_modex_output_correct = False
+        logger.info(
+            f'\tThe module size has not been correctly validated (it is {dumped_module_size} bytes and should be {module_size_in_metadata} bytes)')
+    # Each element in the metadata['pages'] list contains information about one page
+    for page in metadata['pages']:
         page_contents: bytes = get_page_from_dumped_module(module_path, page['offset'], page['size'])
         page_contents_digest: str = hashlib.sha256(page_contents).hexdigest()
         if page_contents_digest == page['sha_256_digest']:
@@ -42,7 +50,7 @@ def validate_modex_output(module_path: str, metadata_path: str) -> None:
         f'\nCheck that there are not overlapping pages (module offset:number of times that offset was written to):')
     # Each byte/offset/address of the module should not be written to more than once
     times_module_offsets_were_written: List[int] = [0] * os.path.getsize(module_path)
-    for page in metadata:
+    for page in metadata['pages']:
         page_offset = page['offset']
         page_size = page['size']
         for i in range(page_offset, page_offset + page_size):

@@ -67,7 +67,7 @@ class Page:
     def __init__(self, virtual_address: int, size: int, pfn_db_entry_prototype_pte_flag: str, module_filename: str,
                  contents_digest: str = None):
         self.virtual_address: int = virtual_address
-        self.size: int = size
+        self.size: int = size  # In bytes
         # pfn_db_entry_prototype_pte_flag can be 'True', 'False', or 'Undetermined'
         self.pfn_db_entry_prototype_pte_flag: str = pfn_db_entry_prototype_pte_flag
         self.module_filename: str = module_filename  # Filename of the dumped module where the page is
@@ -100,7 +100,7 @@ class Module:
         self.name: str = name
         self.path: str = path
         self.base_address: int = base_address  # Virtual base address
-        self.size: int = size  # Size in bytes
+        self.size: int = size  # In bytes
         self.process_id: int = process_id  # Identifier of the process where the module is mapped
         self.filename: str = filename  # Filename of the dumped module
         self.pages: List[Page] = pages
@@ -196,11 +196,11 @@ def find_page_with_certain_digest(pages: List[Page], digest: str) -> Page:
 
 
 def insert_page_into_mixed_module(page: Page, module_base_address: int, mixed_module: bytearray,
-                                  mixed_module_metadata: List[Dict[str, Any]]) -> None:
+                                  mixed_module_pages_metadata: List[Dict[str, Any]]) -> None:
     page_offset: int = page.virtual_address - module_base_address  # Offset of the page inside the module
     page_contents: bytes = get_page_from_dumped_module(page.module_filename, page_offset, page.size)
     mixed_module[page_offset: page_offset + page.size] = page_contents
-    mixed_module_metadata.append(
+    mixed_module_pages_metadata.append(
         create_entry_for_page_in_mixed_module_metadata(page_offset, page.size, page.is_shared(), page.contents_digest))
 
 
@@ -263,7 +263,7 @@ def mix_modules(modules: List[Module], mixed_module_filename: str, mixed_module_
     module_size: int = modules[0].size
     module_base_address: int = modules[0].base_address
     mixed_module: bytearray = bytearray(module_size)  # The mixed module is initialized with zeros
-    mixed_module_metadata: List[Dict[str, Any]] = []
+    mixed_module_pages_metadata: List[Dict[str, Any]] = []  # Metadata about the retrieved pages
 
     # In the mixture dictionary:
     # - The keys are virtual addresses (the virtual address acts here as an id for a page inside a module)
@@ -301,7 +301,8 @@ def mix_modules(modules: List[Module], mixed_module_filename: str, mixed_module_
             if are_all_shared_pages_equal:
                 # All the shared pages have the same contents, it does not matter which one is picked
                 shared_page: Page = mixture[virtual_address][0]
-                insert_page_into_mixed_module(shared_page, module_base_address, mixed_module, mixed_module_metadata)
+                insert_page_into_mixed_module(shared_page, module_base_address, mixed_module,
+                                              mixed_module_pages_metadata)
                 logger.info(
                     f'\tAll the shared pages whose virtual address is {hex(virtual_address)} ({len(mixture[virtual_address])}) (offset {virtual_address - module_base_address}) are equal (SHA-256 digest: {shared_page.contents_digest})')
             else:
@@ -310,7 +311,7 @@ def mix_modules(modules: List[Module], mixed_module_filename: str, mixed_module_
                 most_common_shared_page: Page = find_page_with_certain_digest(mixture[virtual_address],
                                                                               most_common_page_digest)
                 insert_page_into_mixed_module(most_common_shared_page, module_base_address, mixed_module,
-                                              mixed_module_metadata)
+                                              mixed_module_pages_metadata)
                 logger.info(
                     f'\tAll the shared pages whose virtual address is {hex(virtual_address)} ({len(mixture[virtual_address])}) (offset {virtual_address - module_base_address}) are not equal, here is how many times each SHA-256 digest is present:')
                 instances_of_each_page_digest: Dict[str, int] = count_instances_of_each_element(page_digests)
@@ -328,7 +329,36 @@ def mix_modules(modules: List[Module], mixed_module_filename: str, mixed_module_
             calculate_page_digests([representative_page], module_base_address,
                                    False)  # Calculate the SHA-256 digest of the representative page
             insert_page_into_mixed_module(representative_page, module_base_address, mixed_module,
-                                          mixed_module_metadata)
+                                          mixed_module_pages_metadata)
+
+    # Statistics about the information extracted
+    bytes_retrieved: int = 0
+    shared_bytes_retrieved: int = 0
+    private_bytes_retrieved: int = 0
+    for page_metadata_entry in mixed_module_pages_metadata:
+        page_size: int = page_metadata_entry['size']
+        bytes_retrieved += page_size
+        if page_metadata_entry['is_shared']:
+            shared_bytes_retrieved += page_size
+        else:
+            private_bytes_retrieved += page_size
+
+    logger.info(f'\nInformation about the extracted module:')
+    logger.info(f'\tModule size: {module_size} bytes')
+    logger.info(
+        f'\tTotal bytes retrieved: {bytes_retrieved}. As a result the {bytes_retrieved / module_size:.2%} of the module was retrieved. The pages that were not retrieved are filled with zeros.')
+    logger.info(f'\tOf the bytes retrieved:')
+    logger.info(
+        f'\t\t{shared_bytes_retrieved / bytes_retrieved:.2%} were shared ({shared_bytes_retrieved} shared bytes in total)')
+    logger.info(
+        f'\t\t{private_bytes_retrieved / bytes_retrieved:.2%} were private ({private_bytes_retrieved} private bytes in total)')
+
+    # Join all the metadata about the mixed module
+    mixed_module_metadata: Dict[str, Any] = {'pages': mixed_module_pages_metadata,
+                                             'statistics': {'module_size': module_size,
+                                                            'bytes_retrieved': bytes_retrieved,
+                                                            'shared_bytes_retrieved': shared_bytes_retrieved,
+                                                            'private_bytes_retrieved': private_bytes_retrieved}}
 
     with open(mixed_module_filename, mode='wb') as dumped_mixed_module:
         dumped_mixed_module.write(mixed_module)
