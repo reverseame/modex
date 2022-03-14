@@ -17,15 +17,15 @@ from volatility3.framework.renderers import format_hints
 from volatility3.plugins.windows import pslist, dlllist, simple_pteenum
 
 
-def create_log_filename():
+def get_current_utc_timestamp() -> str:
     utc_now = datetime.utcnow()
-    return f'modex_log_{utc_now.strftime("%d-%m-%Y_%H-%M-%S_UTC")}.txt'
+    return utc_now.strftime("%d-%m-%Y_%H-%M-%S_UTC")
 
 
-def create_logger(filename: str):
+def create_logger(file_path: str):
     modex_logger = logging.getLogger('modex_logger')
     modex_logger.setLevel(logging.INFO)
-    file_handler = logging.FileHandler(filename)
+    file_handler = logging.FileHandler(file_path)
     file_handler.setLevel(logging.INFO)
     modex_logger.addHandler(file_handler)
     return modex_logger
@@ -180,9 +180,10 @@ def get_page_from_dumped_module(module_filename: str, page_offset: int, page_siz
 
 
 def create_entry_for_page_in_mixed_module_metadata(page_offset: int, page_size: int, is_page_shared: bool,
-                                                   page_contents_sha_256_digest: str) -> Dict[str, Any]:
+                                                   page_contents_sha_256_digest: str,
+                                                   is_page_anomalous: bool) -> Dict[str, Any]:
     return {'offset': page_offset, 'size': page_size, 'is_shared': is_page_shared,
-            'sha_256_digest': page_contents_sha_256_digest}
+            'sha_256_digest': page_contents_sha_256_digest, 'is_anomalous': is_page_anomalous}
 
 
 def get_most_common_element(elements: List[Any]) -> Any:
@@ -196,12 +197,13 @@ def find_page_with_certain_digest(pages: List[Page], digest: str) -> Page:
 
 
 def insert_page_into_mixed_module(page: Page, module_base_address: int, mixed_module: bytearray,
-                                  mixed_module_pages_metadata: List[Dict[str, Any]]) -> None:
+                                  mixed_module_pages_metadata: List[Dict[str, Any]], is_page_anomalous: bool) -> None:
     page_offset: int = page.virtual_address - module_base_address  # Offset of the page inside the module
     page_contents: bytes = get_page_from_dumped_module(page.module_filename, page_offset, page.size)
     mixed_module[page_offset: page_offset + page.size] = page_contents
     mixed_module_pages_metadata.append(
-        create_entry_for_page_in_mixed_module_metadata(page_offset, page.size, page.is_shared(), page.contents_digest))
+        create_entry_for_page_in_mixed_module_metadata(page_offset, page.size, page.is_shared(), page.contents_digest,
+                                                       is_page_anomalous))
 
 
 def calculate_page_digests(pages: List[Page], module_base_address: int, use_similarity_digest_algorithm: bool) -> None:
@@ -222,8 +224,19 @@ def get_page_digests(pages: List[Page]) -> List[str]:
     return page_digests
 
 
+def check_if_all_tlsh_digests_are_valid(tlsh_digests: List[str]) -> bool:
+    for tlsh_digest in tlsh_digests:
+        if tlsh_digest == 'TNULL':
+            return False
+    return True
+
+
 def choose_representative_page_digest(page_similarity_digests: List[str], logger) -> str:
     """Compare all the page similarity digests received and choose one that is representative."""
+    are_all_tlsh_digests_valid: bool = check_if_all_tlsh_digests_are_valid(page_similarity_digests)
+    if len(page_similarity_digests) < 3 or not are_all_tlsh_digests_valid:
+        return 'INVALID_DIGEST'
+
     # similarity_scores_table is a table with the similarity scores obtained after comparing all the similarity digests between each other
     similarity_scores_table: List[List[int]] = []
     for page_similarity_digest_i in page_similarity_digests:
@@ -257,13 +270,21 @@ def choose_representative_page_digest(page_similarity_digests: List[str], logger
     return representative_page_digest
 
 
-def mix_modules(modules: List[Module], mixed_module_filename: str, mixed_module_metadata_filename: str, logger) -> None:
+def dump_page(page: Page, page_offset: int, file_path: str) -> None:
+    page_contents: bytes = get_page_from_dumped_module(page.module_filename, page_offset, page.size)
+    with open(file_path, 'wb') as dumped_page:
+        dumped_page.write(page_contents)
+
+
+def mix_modules(modules: List[Module], output_directory: str, mixed_module_filename: str,
+                mixed_module_metadata_filename: str, dump_anomalies: bool, logger) -> List[str]:
     if not modules:
-        return
+        return []
     module_size: int = modules[0].size
     module_base_address: int = modules[0].base_address
     mixed_module: bytearray = bytearray(module_size)  # The mixed module is initialized with zeros
     mixed_module_pages_metadata: List[Dict[str, Any]] = []  # Metadata about the retrieved pages
+    files_generated: List[str] = []
 
     # In the mixture dictionary:
     # - The keys are virtual addresses (the virtual address acts here as an id for a page inside a module)
@@ -292,7 +313,7 @@ def mix_modules(modules: List[Module], mixed_module_filename: str, mixed_module_
         else:
             calculate_page_digests(mixture[virtual_address], module_base_address, True)
 
-    logger.info(f'\nResults after choosing a page for each available virtual address:')
+    logger.info('\nResults after choosing a page for each available virtual address:')
     for virtual_address in mixture.keys():
         if mixture_shared_state[virtual_address]:
             # Check the contents that a list of shared pages with the same virtual address have, and write to the mixed module accordingly
@@ -302,7 +323,7 @@ def mix_modules(modules: List[Module], mixed_module_filename: str, mixed_module_
                 # All the shared pages have the same contents, it does not matter which one is picked
                 shared_page: Page = mixture[virtual_address][0]
                 insert_page_into_mixed_module(shared_page, module_base_address, mixed_module,
-                                              mixed_module_pages_metadata)
+                                              mixed_module_pages_metadata, False)
                 logger.info(
                     f'\tAll the shared pages whose virtual address is {hex(virtual_address)} ({len(mixture[virtual_address])}) (offset {virtual_address - module_base_address}) are equal (SHA-256 digest: {shared_page.contents_digest})')
             else:
@@ -311,25 +332,56 @@ def mix_modules(modules: List[Module], mixed_module_filename: str, mixed_module_
                 most_common_shared_page: Page = find_page_with_certain_digest(mixture[virtual_address],
                                                                               most_common_page_digest)
                 insert_page_into_mixed_module(most_common_shared_page, module_base_address, mixed_module,
-                                              mixed_module_pages_metadata)
-                logger.info(
-                    f'\tAll the shared pages whose virtual address is {hex(virtual_address)} ({len(mixture[virtual_address])}) (offset {virtual_address - module_base_address}) are not equal, here is how many times each SHA-256 digest is present:')
+                                              mixed_module_pages_metadata, True)
                 instances_of_each_page_digest: Dict[str, int] = count_instances_of_each_element(page_digests)
+                logger.info(
+                    f'\tAll the shared pages whose virtual address is {hex(virtual_address)} ({len(mixture[virtual_address])}) (offset {virtual_address - module_base_address}) are not equal (there are {len(instances_of_each_page_digest.keys())} different instances), here is how many times each SHA-256 digest is present:')
                 for page_digest in instances_of_each_page_digest.keys():
                     logger.info(f'\t\t{page_digest}: {instances_of_each_page_digest[page_digest]}')
+
+                if dump_anomalies:
+                    different_page_digests = instances_of_each_page_digest.keys()
+                    different_pages: List[Page] = []
+                    for page_digest in different_page_digests:
+                        different_pages.append(find_page_with_certain_digest(mixture[virtual_address], page_digest))
+                    anomalies_directory: str = os.path.join(output_directory, 'anomalies')
+                    if not os.path.exists(anomalies_directory):
+                        os.makedirs(anomalies_directory)
+                    for i in range(0, len(different_pages)):
+                        page: Page = different_pages[i]
+                        page_offset: int = page.virtual_address - module_base_address
+                        page_filename: str = f'shared_page_{i + 1}_at_offset_{page_offset}.dmp'
+                        page_file_path: str = os.path.join(anomalies_directory, page_filename)
+                        dump_page(page, page_offset, page_file_path)
+                        files_generated.append(page_file_path)
         else:
             # In this case, no shared pages were found that started with the current virtual address.
             # As a result, a representative page has to be chosen to be inserted in the mixed module.
             logger.info(
                 f'\tNo shared pages were found that started with the virtual address {hex(virtual_address)} (offset {virtual_address - module_base_address}). As a result, a representative page of the total {len(mixture[virtual_address])} pages has to be chosen. Below is the process followed to choose the representative page:')
             page_similarity_digests: List[str] = get_page_digests(mixture[virtual_address])  # TLSH digests
-            representative_page_digest: str = choose_representative_page_digest(page_similarity_digests, logger)
+
+            # 3 or more digests need to exist in order to make a comparison between all of them to finally choose a representative one, so:
+            #   - If only one digest exists, that digest will be chosen
+            #   - If only two digests exist, the first one is chosen
+            if len(page_similarity_digests) < 3:
+                representative_page_digest: str = page_similarity_digests[0]
+                logger.info(
+                    '\t\tNo comparison could be done because there were less than 3 page digests, so the first digest was chosen')
+            else:
+                representative_page_digest = choose_representative_page_digest(page_similarity_digests, logger)
+                if representative_page_digest == 'INVALID_DIGEST':
+                    # If a representative digest cannot be chosen through a comparison, then the first one is chosen
+                    representative_page_digest = page_similarity_digests[0]
+                    logger.info(
+                        '\t\tNo comparison could be done because not all TLSH digests were valid, so the first digest was chosen')
+
             representative_page: Page = find_page_with_certain_digest(mixture[virtual_address],
                                                                       representative_page_digest)
             calculate_page_digests([representative_page], module_base_address,
                                    False)  # Calculate the SHA-256 digest of the representative page
             insert_page_into_mixed_module(representative_page, module_base_address, mixed_module,
-                                          mixed_module_pages_metadata)
+                                          mixed_module_pages_metadata, False)
 
     # Statistics about the information extracted
     bytes_retrieved: int = 0
@@ -343,11 +395,11 @@ def mix_modules(modules: List[Module], mixed_module_filename: str, mixed_module_
         else:
             private_bytes_retrieved += page_size
 
-    logger.info(f'\nInformation about the extracted module:')
+    logger.info('\nInformation about the extracted module:')
     logger.info(f'\tModule size: {module_size} bytes')
     logger.info(
         f'\tTotal bytes retrieved: {bytes_retrieved}. As a result the {bytes_retrieved / module_size:.2%} of the module was retrieved. The pages that were not retrieved are filled with zeros.')
-    logger.info(f'\tOf the bytes retrieved:')
+    logger.info('\tOf the bytes retrieved:')
     logger.info(
         f'\t\t{shared_bytes_retrieved / bytes_retrieved:.2%} were shared ({shared_bytes_retrieved} shared bytes in total)')
     logger.info(
@@ -360,15 +412,23 @@ def mix_modules(modules: List[Module], mixed_module_filename: str, mixed_module_
                                                             'shared_bytes_retrieved': shared_bytes_retrieved,
                                                             'private_bytes_retrieved': private_bytes_retrieved}}
 
-    with open(mixed_module_filename, mode='wb') as dumped_mixed_module:
+    mixed_module_path: str = os.path.join(output_directory, mixed_module_filename)
+    mixed_module_metadata_path: str = os.path.join(output_directory, mixed_module_metadata_filename)
+
+    with open(mixed_module_path, mode='wb') as dumped_mixed_module:
         dumped_mixed_module.write(mixed_module)
 
-    with open(mixed_module_metadata_filename, 'w') as mixed_module_metadata_file:
+    with open(mixed_module_metadata_path, 'w') as mixed_module_metadata_file:
         json.dump(mixed_module_metadata, mixed_module_metadata_file, ensure_ascii=False, indent=4)
+
+    files_generated.append(mixed_module_path)
+    files_generated.append(mixed_module_metadata_path)
+
+    return files_generated
 
 
 class Modex(interfaces.plugins.PluginInterface):
-    """Modex Volatility 3 plugin."""
+    """Extracts a module as complete as possible."""
     _required_framework_version = (2, 0, 0)
     _version = (0, 0, 1)
 
@@ -391,16 +451,24 @@ class Modex(interfaces.plugins.PluginInterface):
                                            version=(0, 9, 0)),
             requirements.StringRequirement(name="module",
                                            description="Module name",
-                                           optional=False)
+                                           optional=False),
+            requirements.BooleanRequirement(name='dump_anomalies',
+                                            description="When there are different shared pages at the same offset, dump those pages",
+                                            default=False,
+                                            optional=True)
         ]
 
     def run(self):
-        log_filename = create_log_filename()
-        logger = create_logger(log_filename)
+        output_directory: str = f'modex_output_{get_current_utc_timestamp()}'  # Directory where the modex output will be placed
+        os.makedirs(output_directory)
+
+        log_file_path = os.path.join(output_directory, 'modex_log.txt')
+        logger = create_logger(log_file_path)
 
         module_supplied: str = self.config['module'].casefold()
+        dump_anomalies: bool = self.config['dump_anomalies']
         modules_to_mix: List[Module] = []
-        files_finally_generated: List[str] = [log_filename]
+        files_finally_generated: List[str] = [log_file_path]
 
         # For each process, find if the supplied module is mapped on it. If so, dump the module.
         processes = pslist.PsList.list_processes(self.context,
@@ -448,7 +516,7 @@ class Modex(interfaces.plugins.PluginInterface):
                     pass
 
         if not modules_to_mix:
-            logger.info(f'The module supplied is not mapped in any process')
+            logger.info('The module supplied is not mapped in any process')
             return renderers.TreeGrid([("Filename", str)], self._generator(files_finally_generated))
 
         logger.info(f'Modules to mix (before validation) ({len(modules_to_mix)}):')
@@ -492,7 +560,7 @@ class Modex(interfaces.plugins.PluginInterface):
             if module_to_mix.pages[-1].virtual_address == first_out_of_bounds_address:
                 del module_to_mix.pages[-1]
 
-        logger.info(f'\nModules to mix (after validation and alongside the retrieved pages for each one):')
+        logger.info('\nModules to mix (after validation and alongside the retrieved pages for each one):')
         for module_to_mix in modules_to_mix:
             logger.info(f'\t{module_to_mix.get_basic_information()}')
             for page in module_to_mix.pages:
@@ -502,10 +570,8 @@ class Modex(interfaces.plugins.PluginInterface):
         mixed_module_metadata_filename: str = f'{module_supplied.lower()}.description.json'
 
         # Perform the mixture
-        mix_modules(modules_to_mix, mixed_module_filename, mixed_module_metadata_filename, logger)
-
-        files_finally_generated.append(mixed_module_filename)
-        files_finally_generated.append(mixed_module_metadata_filename)
+        files_finally_generated += mix_modules(modules_to_mix, output_directory, mixed_module_filename,
+                                               mixed_module_metadata_filename, dump_anomalies, logger)
 
         # Delete the .dmp files that were used to create the final .dmp file
         delete_dmp_files(modules_to_mix)

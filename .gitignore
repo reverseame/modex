@@ -131,5 +131,4 @@ dmypy.json
 # Added by myself
 .idea/
 .DS_Store
-modex_log_*.txt
-modex_tests_log_*.txt
+tests_log_*.txt
