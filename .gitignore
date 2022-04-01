@@ -132,3 +132,4 @@ dmypy.json
 .idea/
 .DS_Store
 tests_log_*.txt
+inter_modex_output_*

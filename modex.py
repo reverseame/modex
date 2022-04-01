@@ -22,13 +22,13 @@ def get_current_utc_timestamp() -> str:
     return utc_now.strftime("%d-%m-%Y_%H-%M-%S_UTC")
 
 
-def create_logger(file_path: str):
-    modex_logger = logging.getLogger('modex_logger')
-    modex_logger.setLevel(logging.INFO)
+def create_logger(file_path: str, logger_name: str):
+    logger = logging.getLogger(logger_name)
+    logger.setLevel(logging.INFO)
     file_handler = logging.FileHandler(file_path)
     file_handler.setLevel(logging.INFO)
-    modex_logger.addHandler(file_handler)
-    return modex_logger
+    logger.addHandler(file_handler)
+    return logger
 
 
 def get_relevant_page_details(page: List[Any]) -> Dict[str, str]:
@@ -430,7 +430,7 @@ def mix_modules(modules: List[Module], output_directory: str, mixed_module_filen
 class Modex(interfaces.plugins.PluginInterface):
     """Extracts a module as complete as possible."""
     _required_framework_version = (2, 0, 0)
-    _version = (0, 0, 1)
+    _version = (0, 1, 0)
 
     @classmethod
     def get_requirements(cls) -> List[interfaces.configuration.RequirementInterface]:
@@ -459,11 +459,11 @@ class Modex(interfaces.plugins.PluginInterface):
         ]
 
     def run(self):
-        output_directory: str = f'modex_output_{get_current_utc_timestamp()}'  # Directory where the modex output will be placed
+        output_directory: str = f'modex_output_{get_current_utc_timestamp()}'  # Directory where the Modex output will be placed
         os.makedirs(output_directory)
 
         log_file_path = os.path.join(output_directory, 'modex_log.txt')
-        logger = create_logger(log_file_path)
+        logger = create_logger(log_file_path, 'modex_logger')
 
         module_supplied: str = self.config['module'].casefold()
         dump_anomalies: bool = self.config['dump_anomalies']
