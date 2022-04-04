@@ -22,11 +22,11 @@ def get_current_utc_timestamp() -> str:
     return utc_now.strftime("%d-%m-%Y_%H-%M-%S_UTC")
 
 
-def create_logger(file_path: str, logger_name: str):
+def create_logger(file_path: str, logger_name: str, log_level):
     logger = logging.getLogger(logger_name)
-    logger.setLevel(logging.INFO)
+    logger.setLevel(log_level)
     file_handler = logging.FileHandler(file_path)
-    file_handler.setLevel(logging.INFO)
+    file_handler.setLevel(log_level)
     logger.addHandler(file_handler)
     return logger
 
@@ -463,7 +463,7 @@ class Modex(interfaces.plugins.PluginInterface):
         os.makedirs(output_directory)
 
         log_file_path = os.path.join(output_directory, 'modex_log.txt')
-        logger = create_logger(log_file_path, 'modex_logger')
+        logger = create_logger(log_file_path, 'modex_logger', logging.INFO)
 
         module_supplied: str = self.config['module'].casefold()
         dump_anomalies: bool = self.config['dump_anomalies']
