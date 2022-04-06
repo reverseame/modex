@@ -22,11 +22,14 @@ class Anomaly:
 
 
 def validate_output(directory: str) -> None:
+    # A Modex output will only have 1 .dmp file
+    # An InterModex output will have 2 .dmp files if a derelocation process is performed
+    # In the case of InterModex, the validation focuses on the module to which a derelocation process has not been applied
     module_path = None
     metadata_path = None
 
     for filename in os.listdir(directory):
-        if filename.endswith('.dmp'):
+        if filename.endswith('.dmp') and 'after_derelocation' not in filename:
             module_path = os.path.join(directory, filename)
         elif filename.endswith('.json'):
             metadata_path = os.path.join(directory, filename)
