@@ -65,7 +65,7 @@ def check_if_all_elements_are_equal(elements: List[Any]) -> bool:
 
 class Page:
     def __init__(self, virtual_address: int, size: int, pfn_db_entry_prototype_pte_flag: str, module_filename: str,
-                 contents_digest: str = None):
+                 contents_digest: str = None, is_anomalous: bool = False):
         self.virtual_address: int = virtual_address
         self.size: int = size  # In bytes
         # pfn_db_entry_prototype_pte_flag can be 'True', 'False', or 'Undetermined'
@@ -75,6 +75,7 @@ class Page:
         # - For shared pages: SHA-256 digest
         # - For pages considered private: TLSH digests will be used to choose a representative page. However, SHA-256 digests will be used in the metadata file.
         self.contents_digest: str = contents_digest
+        self.is_anomalous: bool = is_anomalous  # This attribute is for InterModex compatibility
 
     def get_basic_information(self):
         return {'virtual_address': hex(self.virtual_address), 'size': hex(self.size),
@@ -282,6 +283,7 @@ def mix_modules(modules: List[Module], output_directory: str, mixed_module_filen
         return []
     module_size: int = modules[0].size
     module_base_address: int = modules[0].base_address
+    module_path: str = modules[0].path
     mixed_module: bytearray = bytearray(module_size)  # The mixed module is initialized with zeros
     mixed_module_pages_metadata: List[Dict[str, Any]] = []  # Metadata about the retrieved pages
     files_generated: List[str] = []
@@ -316,6 +318,15 @@ def mix_modules(modules: List[Module], output_directory: str, mixed_module_filen
     logger.info('\nResults after choosing a page for each available virtual address:')
     for virtual_address in mixture.keys():
         if mixture_shared_state[virtual_address]:
+            # The following code (until indicated) is only useful for InterModex
+            non_anomalous_pages: List[Page] = []
+            for page in mixture[virtual_address]:
+                if not page.is_anomalous:
+                    non_anomalous_pages.append(page)
+            if 0 < len(non_anomalous_pages) < len(mixture[virtual_address]):
+                mixture[virtual_address] = non_anomalous_pages
+            # The code only useful fot InterModex ends here
+
             # Check the contents that a list of shared pages with the same virtual address have, and write to the mixed module accordingly
             page_digests: List[str] = get_page_digests(mixture[virtual_address])  # SHA-256 digests
             are_all_shared_pages_equal: bool = check_if_all_elements_are_equal(page_digests)
@@ -323,7 +334,7 @@ def mix_modules(modules: List[Module], output_directory: str, mixed_module_filen
                 # All the shared pages have the same contents, it does not matter which one is picked
                 shared_page: Page = mixture[virtual_address][0]
                 insert_page_into_mixed_module(shared_page, module_base_address, mixed_module,
-                                              mixed_module_pages_metadata, False)
+                                              mixed_module_pages_metadata, shared_page.is_anomalous)
                 logger.info(
                     f'\tAll the shared pages whose virtual address is {hex(virtual_address)} ({len(mixture[virtual_address])}) (offset {virtual_address - module_base_address}) are equal (SHA-256 digest: {shared_page.contents_digest})')
             else:
@@ -406,11 +417,13 @@ def mix_modules(modules: List[Module], output_directory: str, mixed_module_filen
         f'\t\t{private_bytes_retrieved / bytes_retrieved:.2%} were private ({private_bytes_retrieved} private bytes in total)')
 
     # Join all the metadata about the mixed module
-    mixed_module_metadata: Dict[str, Any] = {'pages': mixed_module_pages_metadata,
-                                             'statistics': {'module_size': module_size,
-                                                            'bytes_retrieved': bytes_retrieved,
+    mixed_module_metadata: Dict[str, Any] = {'module_path': module_path.casefold(),
+                                             'module_base_address': hex(module_base_address),
+                                             'module_size': module_size,
+                                             'statistics': {'bytes_retrieved': bytes_retrieved,
                                                             'shared_bytes_retrieved': shared_bytes_retrieved,
-                                                            'private_bytes_retrieved': private_bytes_retrieved}}
+                                                            'private_bytes_retrieved': private_bytes_retrieved},
+                                             'pages': mixed_module_pages_metadata}
 
     mixed_module_path: str = os.path.join(output_directory, mixed_module_filename)
     mixed_module_metadata_path: str = os.path.join(output_directory, mixed_module_metadata_filename)

@@ -45,7 +45,7 @@ def validate_output(directory: str) -> None:
     # Validate that each page listed in the metadata is in the module
     logger.info('Check that the extracted module and the information in the metadata match:')
     dumped_module_size: int = os.path.getsize(module_path)
-    module_size_in_metadata: int = metadata['statistics']['module_size']
+    module_size_in_metadata: int = metadata['module_size']
     if dumped_module_size == module_size_in_metadata:
         logger.info('\tThe module size has been correctly validated')
     else:

@@ -4,9 +4,25 @@ import argparse
 import traceback
 import subprocess
 import shutil
+import json
 from typing import Dict, Any, List
 
-from modex import get_current_utc_timestamp, create_logger, check_if_all_elements_are_equal
+from modex import Module, Page, get_current_utc_timestamp, create_logger, check_if_all_elements_are_equal, \
+    check_if_modules_can_be_mixed, mix_modules
+
+
+class ModexExtraction:
+    def __init__(self, modex_output: str, module_path: str, metadata_path: str):
+        self.modex_output: str = modex_output
+        self.module_path: str = module_path
+        self.metadata_path: str = metadata_path
+
+
+def get_logger(output_directory: str, log_level):
+    log_file_path = os.path.join(output_directory, 'inter_modex_log.txt')
+    logger = create_logger(log_file_path, 'inter_modex_logger', log_level)
+    logger.propagate = False
+    return logger
 
 
 def obtain_modex_outputs_directory_name(output_directory: str) -> str:
@@ -22,6 +38,16 @@ def create_output_directory(output_directory: str, create_modex_outputs_director
         os.makedirs(output_directory)
 
 
+def get_file_from_modex_output(modex_output: str, extension: str) -> str:
+    """Get a file stored inside a Modex output which is not hidden and has a particular extension."""
+    elements_inside_modex_output: List[str] = os.listdir(modex_output)
+    for element_inside_modex_output in elements_inside_modex_output:
+        if os.path.isfile(
+                os.path.join(modex_output, element_inside_modex_output)) and not element_inside_modex_output.startswith(
+            '.') and element_inside_modex_output.endswith(extension):
+            return os.path.join(modex_output, element_inside_modex_output)
+
+
 def get_not_hidden_files_inside_directory(directory: str) -> List[str]:
     """Get the non-hidden files inside a directory (the file paths returned also include the directory)."""
     elements_inside_directory: List[str] = os.listdir(directory)
@@ -34,6 +60,26 @@ def get_not_hidden_files_inside_directory(directory: str) -> List[str]:
         if not file_inside_directory.startswith('.'):
             not_hidden_files_inside_directory.append(os.path.join(directory, file_inside_directory))
     return not_hidden_files_inside_directory
+
+
+def convert_page_dictionary_to_page_object(page: Dict[str, Any], module_path: str, module_base_address: int) -> Page:
+    return Page(module_base_address + page['offset'], page['size'], 'True' if page['is_shared'] else 'False',
+                module_path, page['sha_256_digest'], page['is_anomalous'])
+
+
+def convert_modex_extraction_to_module(modex_extraction: ModexExtraction) -> Module:
+    with open(modex_extraction.metadata_path) as metadata_file:
+        metadata: Dict[str, Any] = json.load(metadata_file)
+    # Path inside the system whose memory contents where dumped (do not confuse with the module path inside the modex extraction)
+    module_path: str = metadata['module_path']
+    module_base_address: int = int(metadata['module_base_address'], 16)
+    module_size: int = metadata['module_size']
+    pages: List[Page] = []
+    for page_as_dictionary in metadata['pages']:
+        pages.append(convert_page_dictionary_to_page_object(page_as_dictionary, modex_extraction.module_path,
+                                                            module_base_address))
+    # The name and the process_id are irrelevant for InterModex
+    return Module('', module_path, module_base_address, module_size, 0, modex_extraction.module_path, pages)
 
 
 def check_if_modex_run_successfully(modex_output_directory: str) -> bool:
@@ -62,12 +108,55 @@ def check_if_modex_run_successfully(modex_output_directory: str) -> bool:
         return False
 
 
-def perform_mixture(modex_outputs_directory: str, perform_derelocation: bool, output_directory: str, logger) -> None:
-    pass
+def perform_mixture(modex_outputs_directory: str, perform_derelocation: bool, dump_anomalies: bool,
+                    output_directory: str, logger) -> None:
+    modex_outputs: List[str] = os.listdir(modex_outputs_directory)
+    for i in range(0, len(modex_outputs)):
+        modex_outputs[i] = os.path.join(modex_outputs_directory, modex_outputs[i])
+
+    logger.info('\nModex outputs before checking if the Modex executions were successful:')
+    for modex_output in modex_outputs:
+        if os.path.isdir(modex_output):
+            logger.info(f'\t{modex_output}')
+
+    logger.info('\nChecking if the Modex executions were successful:')
+    successful_modex_outputs: List[str] = []
+    for modex_output in modex_outputs:
+        if os.path.isdir(modex_output):
+            if check_if_modex_run_successfully(modex_output):
+                successful_modex_outputs.append(modex_output)
+                logger.info(f'\t{modex_output} meets the requirements for a successful Modex execution')
+            else:
+                logger.info(
+                    f'\t{modex_output} does not meet the requirements for a successful Modex execution. As a result, it will not be considered for the mixture.')
+
+    # Take the .dmp and .json files from each successful Modex output and perform the mixture
+    modex_extractions: List[ModexExtraction] = []
+    for successful_modex_output in successful_modex_outputs:
+        dmp_file: str = get_file_from_modex_output(successful_modex_output, '.dmp')
+        json_file: str = get_file_from_modex_output(successful_modex_output, '.json')
+        if dmp_file is not None and json_file is not None:
+            modex_extractions.append(ModexExtraction(successful_modex_output, dmp_file, json_file))
+        else:
+            logger.info(
+                f'\tThe Modex output {successful_modex_output} was considered successful, but the .dmp file is {dmp_file} and the .json file is {json_file}, and both of them have to exist for a Modex output to be successful. As a result, this output will not be considered for the mixture.')
+
+    logger.info('\nModex outputs that will be mixed:')
+    for modex_extraction in modex_extractions:
+        logger.info(f'\t{modex_extraction.modex_output}')
+
+    modules_to_mix: List[Module] = []
+    for modex_extraction in modex_extractions:
+        modules_to_mix.append(convert_modex_extraction_to_module(modex_extraction))
+
+    can_modules_be_mixed: bool = check_if_modules_can_be_mixed(modules_to_mix, logger)
+    if can_modules_be_mixed:
+        mix_modules(modules_to_mix, output_directory, 'mixed_module.dmp', 'mixed_module.description.json',
+                    dump_anomalies, logger)
 
 
 def perform_extraction(module: str, memory_dumps_directory: str, remove_modex_outputs: bool, perform_derelocation: bool,
-                       volatility_path: str, output_directory: str, logger) -> None:
+                       volatility_path: str, dump_anomalies: bool, output_directory: str, logger) -> None:
     memory_dumps: List[str] = get_not_hidden_files_inside_directory(memory_dumps_directory)
     logger.info('Memory dumps provided:')
     for memory_dump in memory_dumps:
@@ -96,7 +185,7 @@ def perform_extraction(module: str, memory_dumps_directory: str, remove_modex_ou
     logger.debug(f'Working directory after restoring it: {os.getcwd()}')
 
     # Mix the modules previously extracted
-    perform_mixture(modex_outputs_directory_name, perform_derelocation, output_directory, logger)
+    perform_mixture(modex_outputs_directory_name, perform_derelocation, dump_anomalies, output_directory, logger)
 
     if remove_modex_outputs:
         shutil.rmtree(modex_outputs_directory_name)
@@ -106,7 +195,11 @@ def validate_arguments() -> Dict[str, Any]:
     """Parse and validate command line arguments."""
     arg_parser = argparse.ArgumentParser(
         description='Extracts a module as complete as possible from multiple memory dumps')
-    arg_parser.version = '0.0.1'
+    arg_parser.version = '0.1.0'
+    arg_parser.add_argument('-a',
+                            '--dump-anomalies',
+                            action='store_true',
+                            help='When there are different shared pages at the same offset, dump those pages')
     arg_parser.add_argument('-d',
                             '--memory-dumps-directory',
                             help='directory where the memory dumps are (the Modex plugin will be called)')
@@ -145,6 +238,7 @@ def validate_arguments() -> Dict[str, Any]:
     remove_modex_outputs = args.remove_modex_outputs
     perform_derelocation = args.perform_derelocation
     volatility_path = args.volatility_path
+    dump_anomalies = args.dump_anomalies
 
     if memory_dumps_directory is not None and modex_outputs_directory is not None:
         raise ValueError(
@@ -185,6 +279,12 @@ def validate_arguments() -> Dict[str, Any]:
     if module is not None and len(module) > 255:
         raise ValueError('The module name is too long')
 
+    if memory_dumps_directory is not None:
+        memory_dumps_directory = os.path.abspath(memory_dumps_directory)
+
+    if volatility_path is not None:
+        volatility_path = os.path.abspath(volatility_path)
+
     if args.log_level == 'DEBUG':
         log_level_supplied = logging.DEBUG
     elif args.log_level == 'INFO':
@@ -203,8 +303,8 @@ def validate_arguments() -> Dict[str, Any]:
     arguments: Dict[str, Any] = {'module': module, 'memory_dumps_directory': memory_dumps_directory,
                                  'modex_outputs_directory': modex_outputs_directory,
                                  'remove_modex_outputs': remove_modex_outputs,
-                                 'perform_derelocation': perform_derelocation,
-                                 'volatility_path': volatility_path, 'log_level_supplied': log_level_supplied}
+                                 'perform_derelocation': perform_derelocation, 'volatility_path': volatility_path,
+                                 'log_level_supplied': log_level_supplied, 'dump_anomalies': dump_anomalies}
     return arguments
 
 
@@ -214,22 +314,20 @@ def execute() -> None:
 
         # Directory where the InterModex output will be placed
         output_directory: str = f'inter_modex_output_{get_current_utc_timestamp()}'
-        os.makedirs(output_directory)
-
-        log_file_path = os.path.join(output_directory, 'inter_modex_log.txt')
-        logger = create_logger(log_file_path, 'inter_modex_logger', validated_arguments['log_level_supplied'])
-        logger.propagate = False
 
         modex_outputs_directory = validated_arguments['modex_outputs_directory']
         if modex_outputs_directory is not None:
             create_output_directory(output_directory, False)
-            perform_mixture(modex_outputs_directory, validated_arguments['perform_derelocation'], output_directory,
-                            logger)
+            logger = get_logger(output_directory, validated_arguments['log_level_supplied'])
+            perform_mixture(modex_outputs_directory, validated_arguments['perform_derelocation'],
+                            validated_arguments['dump_anomalies'], output_directory, logger)
         else:
             create_output_directory(output_directory, True)
+            logger = get_logger(output_directory, validated_arguments['log_level_supplied'])
             perform_extraction(validated_arguments['module'], validated_arguments['memory_dumps_directory'],
                                validated_arguments['remove_modex_outputs'], validated_arguments['perform_derelocation'],
-                               validated_arguments['volatility_path'], output_directory, logger)
+                               validated_arguments['volatility_path'], validated_arguments['dump_anomalies'],
+                               output_directory, logger)
 
     except Exception as exception:
         print(f'An error occurred ({exception}). Here are more details about the error:\n')
