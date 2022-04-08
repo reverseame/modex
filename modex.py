@@ -117,6 +117,16 @@ def delete_dmp_files(modules: List[Module]) -> None:
         os.remove(module.filename)
 
 
+def delete_zero_bytes_dmp_files() -> None:
+    elements_inside_current_working_directory: List[str] = os.listdir(os.getcwd())
+    for element_inside_current_working_directory in elements_inside_current_working_directory:
+        if os.path.isfile(
+                element_inside_current_working_directory) and element_inside_current_working_directory.endswith(
+                '.dmp') and element_inside_current_working_directory.startswith('pid.') and os.path.getsize(
+                element_inside_current_working_directory) == 0:
+            os.remove(element_inside_current_working_directory)
+
+
 def delete_modules_under_syswow64(modules: List[Module], logger) -> List[Module]:
     modules_not_under_syswow64: List[Module] = []
     modules_under_syswow64: List[Module] = []
@@ -548,6 +558,7 @@ class Modex(interfaces.plugins.PluginInterface):
         can_modules_be_mixed: bool = check_if_modules_can_be_mixed(modules_to_mix, logger)
         if not can_modules_be_mixed:
             delete_dmp_files(modules_to_mix)
+            delete_zero_bytes_dmp_files()
             return renderers.TreeGrid([("Filename", str)], self._generator(files_finally_generated))
 
         logger.info(f'\nModules to mix (after validation) ({len(modules_to_mix)}):')
@@ -588,6 +599,8 @@ class Modex(interfaces.plugins.PluginInterface):
 
         # Delete the .dmp files that were used to create the final .dmp file
         delete_dmp_files(modules_to_mix)
+
+        delete_zero_bytes_dmp_files()
 
         return renderers.TreeGrid([("Filename", str)], self._generator(files_finally_generated))
 
