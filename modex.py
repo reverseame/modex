@@ -440,7 +440,7 @@ def mix_modules(modules: List[Module], output_directory: str, mixed_module_filen
     # Statistics regarding a Modex extraction
     if is_modex_calling:
         process_ids_where_module_is_mapped: List[int] = []
-        number_of_pages_mapped_in_each_process: [Dict[int, Any]] = {}  # The keys are process IDs
+        number_of_pages_mapped_in_each_process: Dict[int, Any] = {}  # The keys are process IDs
 
         for module in modules:
             process_ids_where_module_is_mapped.append(module.process_id)
