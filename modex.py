@@ -4,6 +4,7 @@ import logging
 import hashlib
 import json
 import tlsh
+import time
 from typing import List, Dict, Any
 from datetime import datetime
 from collections import Counter
@@ -122,8 +123,8 @@ def delete_zero_bytes_dmp_files() -> None:
     for element_inside_current_working_directory in elements_inside_current_working_directory:
         if os.path.isfile(
                 element_inside_current_working_directory) and element_inside_current_working_directory.endswith(
-                '.dmp') and element_inside_current_working_directory.startswith('pid.') and os.path.getsize(
-                element_inside_current_working_directory) == 0:
+            '.dmp') and element_inside_current_working_directory.startswith('pid.') and os.path.getsize(
+            element_inside_current_working_directory) == 0:
             os.remove(element_inside_current_working_directory)
 
 
@@ -288,7 +289,8 @@ def dump_page(page: Page, page_offset: int, file_path: str) -> None:
 
 
 def mix_modules(modules: List[Module], output_directory: str, mixed_module_filename: str,
-                mixed_module_metadata_filename: str, dump_anomalies: bool, logger) -> List[str]:
+                mixed_module_metadata_filename: str, dump_anomalies: bool, logger, is_modex_calling: bool,
+                start_time) -> List[str]:
     if not modules:
         return []
     module_size: int = modules[0].size
@@ -430,10 +432,34 @@ def mix_modules(modules: List[Module], output_directory: str, mixed_module_filen
     mixed_module_metadata: Dict[str, Any] = {'module_path': module_path.casefold(),
                                              'module_base_address': hex(module_base_address),
                                              'module_size': module_size,
-                                             'statistics': {'bytes_retrieved': bytes_retrieved,
-                                                            'shared_bytes_retrieved': shared_bytes_retrieved,
-                                                            'private_bytes_retrieved': private_bytes_retrieved},
+                                             'general_statistics': {'bytes_retrieved': bytes_retrieved,
+                                                                    'shared_bytes_retrieved': shared_bytes_retrieved,
+                                                                    'private_bytes_retrieved': private_bytes_retrieved},
                                              'pages': mixed_module_pages_metadata}
+
+    # Statistics regarding a Modex extraction
+    if is_modex_calling:
+        process_ids_where_module_is_mapped: List[int] = []
+        number_of_pages_mapped_in_each_process: [Dict[int, Any]] = {}  # The keys are process IDs
+
+        for module in modules:
+            process_ids_where_module_is_mapped.append(module.process_id)
+            number_of_shared_pages: int = 0
+            number_of_private_pages: int = 0
+            for page in module.pages:
+                if page.is_shared():
+                    number_of_shared_pages += 1
+                else:
+                    number_of_private_pages += 1
+            number_of_pages_mapped_in_each_process[module.process_id] = {
+                'number_of_shared_pages': number_of_shared_pages,
+                'number_of_private_pages': number_of_private_pages}
+
+        end_time = time.time()
+        mixed_module_metadata['modex_statistics'] = {
+            'process_ids_where_module_is_mapped': process_ids_where_module_is_mapped,
+            'number_of_pages_mapped_in_each_process': number_of_pages_mapped_in_each_process,
+            'execution_time_in_seconds': end_time - start_time}
 
     mixed_module_path: str = os.path.join(output_directory, mixed_module_filename)
     mixed_module_metadata_path: str = os.path.join(output_directory, mixed_module_metadata_filename)
@@ -482,6 +508,7 @@ class Modex(interfaces.plugins.PluginInterface):
         ]
 
     def run(self):
+        start_time = time.time()
         output_directory: str = f'modex_output_{get_current_utc_timestamp()}'  # Directory where the Modex output will be placed
         os.makedirs(output_directory)
 
@@ -595,7 +622,7 @@ class Modex(interfaces.plugins.PluginInterface):
 
         # Perform the mixture
         files_finally_generated += mix_modules(modules_to_mix, output_directory, mixed_module_filename,
-                                               mixed_module_metadata_filename, dump_anomalies, logger)
+                                               mixed_module_metadata_filename, dump_anomalies, logger, True, start_time)
 
         # Delete the .dmp files that were used to create the final .dmp file
         delete_dmp_files(modules_to_mix)

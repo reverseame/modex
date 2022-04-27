@@ -154,7 +154,7 @@ def perform_mixture(modex_outputs_directory: str, perform_derelocation: bool, su
     mixed_module_metadata_filename: str = 'mixed_module.description.json'
     if can_modules_be_mixed:
         mix_modules(modules_to_mix, output_directory, mixed_module_filename, mixed_module_metadata_filename,
-                    dump_anomalies, logger)
+                    dump_anomalies, logger, False, None)
 
     if perform_derelocation and os.path.exists(os.path.join(output_directory, mixed_module_filename)):
         derelocator_command = [f'python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), "derelocator.py")}',
