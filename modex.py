@@ -112,6 +112,9 @@ class Module:
                 'process_id': self.process_id, 'filename': self.filename,
                 'number_of_retrieved_pages': len(self.pages)}
 
+    def get_information_for_metadata_file(self):
+        return {'path': self.path, 'base_address': self.base_address, 'size': self.size, 'process_id': self.process_id}
+
 
 def delete_dmp_files(modules: List[Module]) -> None:
     for module in modules:
@@ -288,6 +291,46 @@ def dump_page(page: Page, page_offset: int, file_path: str) -> None:
         dumped_page.write(page_contents)
 
 
+def detect_dll_proxying(modules: List[Module], output_directory: str, detection_info_filename: str, logger) -> List[
+    str]:
+    mapped_modules_info: List[Dict[str, Any]] = []
+    for module in modules:
+        mapped_modules_info.append(module.get_information_for_metadata_file())
+    detection_info: Dict[str, Any] = {'mapped_modules': mapped_modules_info}
+    most_common_path: str = get_most_common_element([module.path.casefold() for module in modules])
+    most_common_size: int = get_most_common_element([module.size for module in modules])
+
+    # Look at the cases where the path or the size do not match with the most common ones and mark them as suspicious
+    suspicious_modules: List[Module] = []
+    for module in modules:
+        if module.path.casefold() != most_common_path or module.size != most_common_size:
+            suspicious_modules.append(module)
+
+    detection_result_key: str = 'dll_proxying_detection_result'
+    if suspicious_modules:
+        detection_info[detection_result_key] = True
+    else:
+        detection_info[detection_result_key] = False
+
+    detection_details: Dict[str, Any] = {}
+    suspicious_processes: List[int] = []
+    for suspicious_module in suspicious_modules:
+        suspicious_processes.append(suspicious_module.process_id)
+
+    detection_details['suspicious_processes'] = suspicious_processes
+    detection_info['detection_details'] = detection_details
+
+    files_generated: List[str] = []
+    detection_info_path: str = os.path.join(output_directory, detection_info_filename)
+    with open(detection_info_path, 'w') as detection_details_file:
+        json.dump(detection_info, detection_details_file, ensure_ascii=False, indent=4)
+
+    files_generated.append(detection_info_path)
+    logger.info(
+        f'\nThe --detect option was supplied to detect the presence of the DLL proxying technique. For more details check the {detection_info_filename} file.')
+    return files_generated
+
+
 def mix_modules(modules: List[Module], output_directory: str, mixed_module_filename: str,
                 mixed_module_metadata_filename: str, dump_anomalies: bool, logger, is_modex_calling: bool,
                 start_time) -> List[str]:
@@ -428,6 +471,10 @@ def mix_modules(modules: List[Module], output_directory: str, mixed_module_filen
     logger.info(
         f'\t\t{private_bytes_retrieved / bytes_retrieved:.2%} were private ({private_bytes_retrieved} private bytes in total)')
 
+    mixed_modules_info: List[Dict[str, Any]] = []
+    for module in modules:
+        mixed_modules_info.append(module.get_information_for_metadata_file())
+
     # Join all the metadata about the mixed module
     mixed_module_metadata: Dict[str, Any] = {'module_path': module_path.casefold(),
                                              'module_base_address': hex(module_base_address),
@@ -435,7 +482,7 @@ def mix_modules(modules: List[Module], output_directory: str, mixed_module_filen
                                              'general_statistics': {'bytes_retrieved': bytes_retrieved,
                                                                     'shared_bytes_retrieved': shared_bytes_retrieved,
                                                                     'private_bytes_retrieved': private_bytes_retrieved},
-                                             'pages': mixed_module_pages_metadata}
+                                             'pages': mixed_module_pages_metadata, 'mixed_modules': mixed_modules_info}
 
     # Statistics regarding a Modex extraction
     if is_modex_calling:
@@ -504,6 +551,10 @@ class Modex(interfaces.plugins.PluginInterface):
             requirements.BooleanRequirement(name='dump_anomalies',
                                             description="When there are different shared pages at the same offset, dump those pages",
                                             default=False,
+                                            optional=True),
+            requirements.BooleanRequirement(name='detect',
+                                            description="Detect the presence of the DLL proxying technique",
+                                            default=False,
                                             optional=True)
         ]
 
@@ -517,6 +568,7 @@ class Modex(interfaces.plugins.PluginInterface):
 
         module_supplied: str = self.config['module'].casefold()
         dump_anomalies: bool = self.config['dump_anomalies']
+        is_detect_option_supplied: bool = self.config['detect']
         modules_to_mix: List[Module] = []
         files_finally_generated: List[str] = [log_file_path]
 
@@ -550,18 +602,23 @@ class Modex(interfaces.plugins.PluginInterface):
                             module_size = None
 
                         if module_base_address is not None and module_size is not None:
-                            file_handle = dlllist.DllList.dump_pe(self.context,
-                                                                  pe_table_name,
-                                                                  entry,
-                                                                  self.open,
-                                                                  process_layer_name,
-                                                                  prefix=f'pid.{process_id}.')
-                            if file_handle:
-                                file_handle.close()
-                                dumped_module_filename = file_handle.preferred_filename
+                            if is_detect_option_supplied:  # In this case, there is no need to dump the modules
                                 modules_to_mix.append(
-                                    Module(module_name, module_path, module_base_address, module_size,
-                                           process_id, dumped_module_filename, []))
+                                    Module(module_name, module_path, module_base_address, module_size, process_id, '',
+                                           []))
+                            else:
+                                file_handle = dlllist.DllList.dump_pe(self.context,
+                                                                      pe_table_name,
+                                                                      entry,
+                                                                      self.open,
+                                                                      process_layer_name,
+                                                                      prefix=f'pid.{process_id}.')
+                                if file_handle:
+                                    file_handle.close()
+                                    dumped_module_filename = file_handle.preferred_filename
+                                    modules_to_mix.append(
+                                        Module(module_name, module_path, module_base_address, module_size,
+                                               process_id, dumped_module_filename, []))
                 except exceptions.InvalidAddressException:
                     pass
 
@@ -569,7 +626,7 @@ class Modex(interfaces.plugins.PluginInterface):
             logger.info('The module supplied is not mapped in any process')
             return renderers.TreeGrid([("Filename", str)], self._generator(files_finally_generated))
 
-        logger.info(f'Modules to mix (before validation) ({len(modules_to_mix)}):')
+        logger.info(f'Mapped modules (before validation) ({len(modules_to_mix)}):')
         for module_to_mix in modules_to_mix:
             logger.info(f'\t{module_to_mix.get_basic_information()}')
 
@@ -578,7 +635,13 @@ class Modex(interfaces.plugins.PluginInterface):
 
         if not modules_to_mix:
             logger.info(
-                '\nAll the identified modules are under the C:\\Windows\\SysWOW64 directory, as a result, they cannot be mixed')
+                '\nAll the identified modules are under the C:\\Windows\\SysWOW64 directory, as a result, the execution cannot proceed')
+            return renderers.TreeGrid([("Filename", str)], self._generator(files_finally_generated))
+
+        if is_detect_option_supplied:
+            detection_info_filename: str = 'detection.json'
+            files_finally_generated += detect_dll_proxying(modules_to_mix, output_directory, detection_info_filename,
+                                                           logger)
             return renderers.TreeGrid([("Filename", str)], self._generator(files_finally_generated))
 
         # Make sure that the modules can be mixed
