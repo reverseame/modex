@@ -8,7 +8,17 @@ import json
 from typing import Dict, Any, List
 
 from modex import Module, Page, get_current_utc_timestamp, create_logger, check_if_all_elements_are_equal, \
-    check_if_modules_can_be_mixed, mix_modules
+    check_if_modules_can_be_mixed, mix_modules, get_detection_information_filename, log_detection_process_common_parts, \
+    get_most_common_element
+
+
+class ModexDetectionAttempt:
+    def __init__(self, memory_dump_location: str, mapped_modules: List[Module], result: bool,
+                 suspicious_processes: List[int]):
+        self.memory_dump_location: str = memory_dump_location
+        self.mapped_modules: List[Module] = mapped_modules
+        self.result: bool = result
+        self.suspicious_processes: List[int] = suspicious_processes
 
 
 class ModexExtraction:
@@ -82,16 +92,19 @@ def convert_modex_extraction_to_module(modex_extraction: ModexExtraction) -> Mod
     return Module('', module_path, module_base_address, module_size, 0, modex_extraction.module_path, pages)
 
 
-def check_if_modex_run_successfully(modex_output_directory: str) -> bool:
+def check_if_modex_ran_successfully(modex_output_directory: str, was_detect_option_supplied: bool) -> bool:
     """Check if an output from the Modex plugin contains the files it should contain for a successful execution."""
-    # An output from the Modex plugin, without taking directories into account, should contain 3 files if the execution was successful:
+    # An output from the Modex plugin, without taking directories into account and without supplying the --detect option, should contain 3 files if the execution was successful:
     # - A .dmp file
     # - A .json file
     # - A .txt file
+    # Note: If the --detect option was supplied to Modex, then a .dmp file will not be created
+
+    number_of_generated_files: int = 2 if was_detect_option_supplied else 3
+    extensions: List[str] = ['.json', '.txt'] if was_detect_option_supplied else ['.dmp', '.json', '.txt']
     not_hidden_files_inside_modex_output: List[str] = get_not_hidden_files_inside_directory(modex_output_directory)
-    if len(not_hidden_files_inside_modex_output) == 3:
-        extensions: List[str] = ['.dmp', '.json', '.txt']
-        presence_of_extensions: List[bool] = [False, False, False]
+    if len(not_hidden_files_inside_modex_output) == number_of_generated_files:
+        presence_of_extensions: List[bool] = [False, False] if was_detect_option_supplied else [False, False, False]
         for file_inside_modex_output in not_hidden_files_inside_modex_output:
             file_has_required_extension: bool = False
             i: int = 0
@@ -108,8 +121,7 @@ def check_if_modex_run_successfully(modex_output_directory: str) -> bool:
         return False
 
 
-def perform_mixture(modex_outputs_directory: str, perform_derelocation: bool, sum_path: str, dump_anomalies: bool,
-                    output_directory: str, logger) -> None:
+def get_succesful_modex_outputs(modex_outputs_directory: str, was_detect_option_supplied: bool, logger) -> List[str]:
     modex_outputs: List[str] = os.listdir(modex_outputs_directory)
     for i in range(0, len(modex_outputs)):
         modex_outputs[i] = os.path.join(modex_outputs_directory, modex_outputs[i])
@@ -123,12 +135,78 @@ def perform_mixture(modex_outputs_directory: str, perform_derelocation: bool, su
     successful_modex_outputs: List[str] = []
     for modex_output in modex_outputs:
         if os.path.isdir(modex_output):
-            if check_if_modex_run_successfully(modex_output):
+            if check_if_modex_ran_successfully(modex_output, was_detect_option_supplied):
                 successful_modex_outputs.append(modex_output)
                 logger.info(f'\t{modex_output} meets the requirements for a successful Modex execution')
             else:
                 logger.info(
                     f'\t{modex_output} does not meet the requirements for a successful Modex execution. As a result, it will not be considered for the mixture.')
+    return successful_modex_outputs
+
+
+def convert_mapped_modules_from_json_to_objects(mapped_modules: List[Dict[str, Any]]) -> List[Module]:
+    mapped_modules_converted: List[Module] = []
+    for mapped_module in mapped_modules:
+        mapped_modules_converted.append(
+            Module('', mapped_module['path'], mapped_module['base_address'], mapped_module['size'],
+                   mapped_module['process_id'], '', []))
+    return mapped_modules_converted
+
+
+def detect_dll_proxying_across_several_memory_dumps(modex_detection_attempts: List[ModexDetectionAttempt],
+                                                    output_directory: str, logger) -> None:
+    detection_info: Dict[str, Any] = {}
+    mapped_modules: List[Module] = []
+    for modex_detection_attempt in modex_detection_attempts:
+        mapped_modules += modex_detection_attempt.mapped_modules
+
+    most_common_path: str = get_most_common_element([module.path.casefold() for module in mapped_modules])
+    most_common_size: int = get_most_common_element([module.size for module in mapped_modules])
+
+    suspicious_processes: Dict[str, Any] = {}  # The keys are memory dumps
+    for modex_detection_attempt in modex_detection_attempts:
+        for module in modex_detection_attempt.mapped_modules:
+            if module.path.casefold() != most_common_path or module.size != most_common_size:
+                if modex_detection_attempt.memory_dump_location not in suspicious_processes.keys():
+                    suspicious_processes[modex_detection_attempt.memory_dump_location] = [module.process_id]
+                else:
+                    suspicious_processes[modex_detection_attempt.memory_dump_location].append(module.process_id)
+
+    detection_info['dll_proxying_detection_result'] = True if suspicious_processes else False
+    detection_info['suspicious_processes'] = suspicious_processes
+
+    detection_info_path: str = os.path.join(output_directory, get_detection_information_filename())
+    with open(detection_info_path, 'w') as detection_info_file:
+        json.dump(detection_info, detection_info_file, ensure_ascii=False, indent=4)
+
+    log_detection_process_common_parts(logger)
+
+
+def perform_detection(modex_outputs_directory: str, output_directory: str, logger) -> None:
+    successful_modex_outputs: List[str] = get_succesful_modex_outputs(modex_outputs_directory, True, logger)
+    modex_detection_attempts: List[ModexDetectionAttempt] = []
+
+    # Get the .json files from each successful Modex output and perform the detection
+    for successful_modex_output in successful_modex_outputs:
+        json_file: str = get_file_from_modex_output(successful_modex_output, '.json')
+        if json_file is not None:
+            with open(json_file) as detection_info_file:
+                detection_info: Dict[str, Any] = json.load(detection_info_file)
+            mapped_modules: List[Module] = convert_mapped_modules_from_json_to_objects(detection_info['mapped_modules'])
+            modex_detection_attempts.append(
+                ModexDetectionAttempt(detection_info['memory_dump_location'], mapped_modules,
+                                      detection_info['dll_proxying_detection_result'],
+                                      detection_info['suspicious_processes']))
+        else:
+            logger.info(
+                f'\tThe Modex output {successful_modex_output} was considered successful, but the .json file does not exist, and it must exist for a Modex output to be successful. As a result, this output will not be considered in the detection process.')
+
+    detect_dll_proxying_across_several_memory_dumps(modex_detection_attempts, output_directory, logger)
+
+
+def perform_mixture(modex_outputs_directory: str, perform_derelocation: bool, sum_path: str, dump_anomalies: bool,
+                    output_directory: str, logger) -> None:
+    successful_modex_outputs: List[str] = get_succesful_modex_outputs(modex_outputs_directory, False, logger)
 
     # Take the .dmp and .json files from each successful Modex output and perform the mixture
     modex_extractions: List[ModexExtraction] = []
@@ -168,9 +246,10 @@ def perform_mixture(modex_outputs_directory: str, perform_derelocation: bool, su
             logger.info(f'\nThe derelocation process was not successful (exit code {derelocator_exit_code})')
 
 
-def perform_extraction(module: str, memory_dumps_directory: str, remove_modex_outputs: bool, perform_derelocation: bool,
-                       sum_path: str, volatility_path: str, dump_anomalies: bool, output_directory: str,
-                       logger) -> None:
+def perform_operation_after_getting_modex_outputs(module: str, memory_dumps_directory: str, remove_modex_outputs: bool,
+                                                  perform_derelocation: bool, sum_path: str, volatility_path: str,
+                                                  dump_anomalies: bool, detect: bool, output_directory: str,
+                                                  logger) -> None:
     memory_dumps: List[str] = get_not_hidden_files_inside_directory(memory_dumps_directory)
     logger.info('Memory dumps provided:')
     for memory_dump in memory_dumps:
@@ -184,8 +263,12 @@ def perform_extraction(module: str, memory_dumps_directory: str, remove_modex_ou
     # Invoke the Modex plugin for each memory dump inside the memory dumps directory
     logger.info('\nModex plugin execution:')
     for memory_dump in memory_dumps:
-        volatility_command = ['python3', volatility_path, '-f', memory_dump, 'windows.modex', '--module', module,
-                              '--dump-anomalies']
+        if detect:
+            volatility_command = ['python3', volatility_path, '-f', memory_dump, 'windows.modex', '--module', module,
+                                  '--detect']
+        else:
+            volatility_command = ['python3', volatility_path, '-f', memory_dump, 'windows.modex', '--module', module,
+                                  '--dump-anomalies']
         with subprocess.Popen(volatility_command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as modex_plugin:
             print(f'Running the Modex plugin for the following memory dump: {memory_dump}')
             modex_plugin_exit_code = modex_plugin.wait()
@@ -198,9 +281,12 @@ def perform_extraction(module: str, memory_dumps_directory: str, remove_modex_ou
     os.chdir(current_working_directory)  # Restore the working directory
     logger.debug(f'Working directory after restoring it: {os.getcwd()}')
 
-    # Mix the modules previously extracted
-    perform_mixture(modex_outputs_directory_name, perform_derelocation, sum_path, dump_anomalies, output_directory,
-                    logger)
+    if detect:
+        perform_detection(modex_outputs_directory_name, output_directory, logger)
+    else:
+        # Mix the modules previously extracted
+        perform_mixture(modex_outputs_directory_name, perform_derelocation, sum_path, dump_anomalies, output_directory,
+                        logger)
 
     if remove_modex_outputs:
         shutil.rmtree(modex_outputs_directory_name)
@@ -218,6 +304,9 @@ def validate_arguments() -> Dict[str, Any]:
     arg_parser.add_argument('-d',
                             '--memory-dumps-directory',
                             help='directory where the memory dumps are (the Modex plugin will be called)')
+    arg_parser.add_argument('--detect',
+                            action='store_true',
+                            help='detect the presence of the DLL proxying technique')
     arg_parser.add_argument('-l',
                             '--log-level',
                             choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
@@ -258,6 +347,7 @@ def validate_arguments() -> Dict[str, Any]:
     volatility_path = args.volatility_path
     dump_anomalies = args.dump_anomalies
     sum_path = args.sum_path
+    detect = args.detect
 
     if memory_dumps_directory is not None and modex_outputs_directory is not None:
         raise ValueError(
@@ -306,6 +396,10 @@ def validate_arguments() -> Dict[str, Any]:
     if module is not None and len(module) > 255:
         raise ValueError('The module name is too long')
 
+    if (perform_derelocation or dump_anomalies) and detect:
+        raise ValueError(
+            'You cannot supply the --detect option alongside the --perform-derelocation or --dump-anomalies options')
+
     if memory_dumps_directory is not None:
         memory_dumps_directory = os.path.abspath(memory_dumps_directory)
 
@@ -334,7 +428,7 @@ def validate_arguments() -> Dict[str, Any]:
                                  'remove_modex_outputs': remove_modex_outputs,
                                  'perform_derelocation': perform_derelocation, 'volatility_path': volatility_path,
                                  'log_level_supplied': log_level_supplied, 'dump_anomalies': dump_anomalies,
-                                 'sum_path': sum_path}
+                                 'sum_path': sum_path, 'detect': detect}
     return arguments
 
 
@@ -349,16 +443,25 @@ def execute() -> None:
         if modex_outputs_directory is not None:
             create_output_directory(output_directory, False)
             logger = get_logger(output_directory, validated_arguments['log_level_supplied'])
-            perform_mixture(modex_outputs_directory, validated_arguments['perform_derelocation'],
-                            validated_arguments['sum_path'], validated_arguments['dump_anomalies'], output_directory,
-                            logger)
+            if validated_arguments['detect']:
+                perform_detection(modex_outputs_directory, output_directory, logger)
+            else:
+                perform_mixture(modex_outputs_directory, validated_arguments['perform_derelocation'],
+                                validated_arguments['sum_path'], validated_arguments['dump_anomalies'],
+                                output_directory,
+                                logger)
         else:
             create_output_directory(output_directory, True)
             logger = get_logger(output_directory, validated_arguments['log_level_supplied'])
-            perform_extraction(validated_arguments['module'], validated_arguments['memory_dumps_directory'],
-                               validated_arguments['remove_modex_outputs'], validated_arguments['perform_derelocation'],
-                               validated_arguments['sum_path'], validated_arguments['volatility_path'],
-                               validated_arguments['dump_anomalies'], output_directory, logger)
+            perform_operation_after_getting_modex_outputs(validated_arguments['module'],
+                                                          validated_arguments['memory_dumps_directory'],
+                                                          validated_arguments['remove_modex_outputs'],
+                                                          validated_arguments['perform_derelocation'],
+                                                          validated_arguments['sum_path'],
+                                                          validated_arguments['volatility_path'],
+                                                          validated_arguments['dump_anomalies'],
+                                                          validated_arguments['detect'], output_directory,
+                                                          logger)
 
     except Exception as exception:
         print(f'An error occurred ({exception}). Here are more details about the error:\n')

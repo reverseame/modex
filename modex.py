@@ -291,12 +291,23 @@ def dump_page(page: Page, page_offset: int, file_path: str) -> None:
         dumped_page.write(page_contents)
 
 
-def detect_dll_proxying(modules: List[Module], output_directory: str, detection_info_filename: str, logger) -> List[
-    str]:
+def get_detection_information_filename() -> str:
+    return 'detection_information.json'
+
+
+def log_detection_process_common_parts(logger) -> None:
+    logger.info(
+        f'\nThe --detect option was supplied to detect the presence of the DLL proxying technique. For more details check the {get_detection_information_filename()} file.')
+
+
+def detect_dll_proxying_inside_one_memory_dump(modules: List[Module], output_directory: str, memory_dump_location: str,
+                                               logger) -> List[str]:
     mapped_modules_info: List[Dict[str, Any]] = []
     for module in modules:
         mapped_modules_info.append(module.get_information_for_metadata_file())
-    detection_info: Dict[str, Any] = {'mapped_modules': mapped_modules_info}
+
+    detection_info: Dict[str, Any] = {'memory_dump_location': memory_dump_location,
+                                      'mapped_modules': mapped_modules_info}
     most_common_path: str = get_most_common_element([module.path.casefold() for module in modules])
     most_common_size: int = get_most_common_element([module.size for module in modules])
 
@@ -306,34 +317,27 @@ def detect_dll_proxying(modules: List[Module], output_directory: str, detection_
         if module.path.casefold() != most_common_path or module.size != most_common_size:
             suspicious_modules.append(module)
 
-    detection_result_key: str = 'dll_proxying_detection_result'
-    if suspicious_modules:
-        detection_info[detection_result_key] = True
-    else:
-        detection_info[detection_result_key] = False
+    detection_info['dll_proxying_detection_result'] = True if suspicious_modules else False
 
-    detection_details: Dict[str, Any] = {}
     suspicious_processes: List[int] = []
     for suspicious_module in suspicious_modules:
         suspicious_processes.append(suspicious_module.process_id)
 
-    detection_details['suspicious_processes'] = suspicious_processes
-    detection_info['detection_details'] = detection_details
+    detection_info['suspicious_processes'] = suspicious_processes
 
     files_generated: List[str] = []
-    detection_info_path: str = os.path.join(output_directory, detection_info_filename)
-    with open(detection_info_path, 'w') as detection_details_file:
-        json.dump(detection_info, detection_details_file, ensure_ascii=False, indent=4)
+    detection_info_path: str = os.path.join(output_directory, get_detection_information_filename())
+    with open(detection_info_path, 'w') as detection_info_file:
+        json.dump(detection_info, detection_info_file, ensure_ascii=False, indent=4)
 
     files_generated.append(detection_info_path)
-    logger.info(
-        f'\nThe --detect option was supplied to detect the presence of the DLL proxying technique. For more details check the {detection_info_filename} file.')
+    log_detection_process_common_parts(logger)
     return files_generated
 
 
 def mix_modules(modules: List[Module], output_directory: str, mixed_module_filename: str,
                 mixed_module_metadata_filename: str, dump_anomalies: bool, logger, is_modex_calling: bool,
-                start_time) -> List[str]:
+                start_time, memory_dump_location: str = None) -> List[str]:
     if not modules:
         return []
     module_size: int = modules[0].size
@@ -471,10 +475,6 @@ def mix_modules(modules: List[Module], output_directory: str, mixed_module_filen
     logger.info(
         f'\t\t{private_bytes_retrieved / bytes_retrieved:.2%} were private ({private_bytes_retrieved} private bytes in total)')
 
-    mixed_modules_info: List[Dict[str, Any]] = []
-    for module in modules:
-        mixed_modules_info.append(module.get_information_for_metadata_file())
-
     # Join all the metadata about the mixed module
     mixed_module_metadata: Dict[str, Any] = {'module_path': module_path.casefold(),
                                              'module_base_address': hex(module_base_address),
@@ -482,14 +482,16 @@ def mix_modules(modules: List[Module], output_directory: str, mixed_module_filen
                                              'general_statistics': {'bytes_retrieved': bytes_retrieved,
                                                                     'shared_bytes_retrieved': shared_bytes_retrieved,
                                                                     'private_bytes_retrieved': private_bytes_retrieved},
-                                             'pages': mixed_module_pages_metadata, 'mixed_modules': mixed_modules_info}
+                                             'pages': mixed_module_pages_metadata}
 
     # Statistics regarding a Modex extraction
     if is_modex_calling:
+        mixed_modules_info: List[Dict[str, Any]] = []
         process_ids_where_module_is_mapped: List[int] = []
         number_of_pages_mapped_in_each_process: Dict[int, Any] = {}  # The keys are process IDs
 
         for module in modules:
+            mixed_modules_info.append(module.get_information_for_metadata_file())
             process_ids_where_module_is_mapped.append(module.process_id)
             number_of_shared_pages: int = 0
             number_of_private_pages: int = 0
@@ -503,6 +505,8 @@ def mix_modules(modules: List[Module], output_directory: str, mixed_module_filen
                 'number_of_private_pages': number_of_private_pages}
 
         end_time = time.time()
+        mixed_module_metadata['mixed_modules'] = mixed_modules_info
+        mixed_module_metadata['memory_dump_location'] = memory_dump_location
         mixed_module_metadata['modex_statistics'] = {
             'process_ids_where_module_is_mapped': process_ids_where_module_is_mapped,
             'number_of_pages_mapped_in_each_process': number_of_pages_mapped_in_each_process,
@@ -560,6 +564,7 @@ class Modex(interfaces.plugins.PluginInterface):
 
     def run(self):
         start_time = time.time()
+        memory_dump_location = self.context.config['automagic.LayerStacker.single_location']
         output_directory: str = f'modex_output_{get_current_utc_timestamp()}'  # Directory where the Modex output will be placed
         os.makedirs(output_directory)
 
@@ -639,9 +644,8 @@ class Modex(interfaces.plugins.PluginInterface):
             return renderers.TreeGrid([("Filename", str)], self._generator(files_finally_generated))
 
         if is_detect_option_supplied:
-            detection_info_filename: str = 'detection.json'
-            files_finally_generated += detect_dll_proxying(modules_to_mix, output_directory, detection_info_filename,
-                                                           logger)
+            files_finally_generated += detect_dll_proxying_inside_one_memory_dump(modules_to_mix, output_directory,
+                                                                                  memory_dump_location, logger)
             return renderers.TreeGrid([("Filename", str)], self._generator(files_finally_generated))
 
         # Make sure that the modules can be mixed
@@ -685,7 +689,8 @@ class Modex(interfaces.plugins.PluginInterface):
 
         # Perform the mixture
         files_finally_generated += mix_modules(modules_to_mix, output_directory, mixed_module_filename,
-                                               mixed_module_metadata_filename, dump_anomalies, logger, True, start_time)
+                                               mixed_module_metadata_filename, dump_anomalies, logger, True, start_time,
+                                               memory_dump_location)
 
         # Delete the .dmp files that were used to create the final .dmp file
         delete_dmp_files(modules_to_mix)
