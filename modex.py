@@ -297,11 +297,11 @@ def get_detection_information_filename() -> str:
 
 def log_detection_process_common_parts(logger) -> None:
     logger.info(
-        f'\nThe --detect option was supplied to detect the presence of the DLL proxying technique. For more details check the {get_detection_information_filename()} file.')
+        f'\nThe --detect option was supplied to detect the presence of the DLL hijacking technique. For more details check the {get_detection_information_filename()} file.')
 
 
-def detect_dll_proxying_inside_one_memory_dump(modules: List[Module], output_directory: str, memory_dump_location: str,
-                                               logger) -> List[str]:
+def detect_dll_hijacking_inside_one_memory_dump(modules: List[Module], output_directory: str, memory_dump_location: str,
+                                                logger) -> List[str]:
     mapped_modules_info: List[Dict[str, Any]] = []
     for module in modules:
         mapped_modules_info.append(module.get_information_for_metadata_file())
@@ -317,7 +317,7 @@ def detect_dll_proxying_inside_one_memory_dump(modules: List[Module], output_dir
         if module.path.casefold() != most_common_path or module.size != most_common_size:
             suspicious_modules.append(module)
 
-    detection_info['dll_proxying_detection_result'] = True if suspicious_modules else False
+    detection_info['dll_hijacking_detection_result'] = True if suspicious_modules else False
 
     suspicious_processes: List[int] = []
     for suspicious_module in suspicious_modules:
@@ -557,7 +557,7 @@ class Modex(interfaces.plugins.PluginInterface):
                                             default=False,
                                             optional=True),
             requirements.BooleanRequirement(name='detect',
-                                            description="Detect the presence of the DLL proxying technique",
+                                            description="Detect the presence of the DLL hijacking technique",
                                             default=False,
                                             optional=True)
         ]
@@ -644,8 +644,8 @@ class Modex(interfaces.plugins.PluginInterface):
             return renderers.TreeGrid([("Filename", str)], self._generator(files_finally_generated))
 
         if is_detect_option_supplied:
-            files_finally_generated += detect_dll_proxying_inside_one_memory_dump(modules_to_mix, output_directory,
-                                                                                  memory_dump_location, logger)
+            files_finally_generated += detect_dll_hijacking_inside_one_memory_dump(modules_to_mix, output_directory,
+                                                                                   memory_dump_location, logger)
             return renderers.TreeGrid([("Filename", str)], self._generator(files_finally_generated))
 
         # Make sure that the modules can be mixed

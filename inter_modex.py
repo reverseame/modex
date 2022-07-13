@@ -153,8 +153,8 @@ def convert_mapped_modules_from_json_to_objects(mapped_modules: List[Dict[str, A
     return mapped_modules_converted
 
 
-def detect_dll_proxying_across_several_memory_dumps(modex_detection_attempts: List[ModexDetectionAttempt],
-                                                    output_directory: str, logger) -> None:
+def detect_dll_hijacking_across_several_memory_dumps(modex_detection_attempts: List[ModexDetectionAttempt],
+                                                     output_directory: str, logger) -> None:
     detection_info: Dict[str, Any] = {}
     mapped_modules: List[Module] = []
     for modex_detection_attempt in modex_detection_attempts:
@@ -172,7 +172,7 @@ def detect_dll_proxying_across_several_memory_dumps(modex_detection_attempts: Li
                 else:
                     suspicious_processes[modex_detection_attempt.memory_dump_location].append(module.process_id)
 
-    detection_info['dll_proxying_detection_result'] = True if suspicious_processes else False
+    detection_info['dll_hijacking_detection_result'] = True if suspicious_processes else False
     detection_info['suspicious_processes'] = suspicious_processes
 
     detection_info_path: str = os.path.join(output_directory, get_detection_information_filename())
@@ -195,13 +195,13 @@ def perform_detection(modex_outputs_directory: str, output_directory: str, logge
             mapped_modules: List[Module] = convert_mapped_modules_from_json_to_objects(detection_info['mapped_modules'])
             modex_detection_attempts.append(
                 ModexDetectionAttempt(detection_info['memory_dump_location'], mapped_modules,
-                                      detection_info['dll_proxying_detection_result'],
+                                      detection_info['dll_hijacking_detection_result'],
                                       detection_info['suspicious_processes']))
         else:
             logger.info(
                 f'\tThe Modex output {successful_modex_output} was considered successful, but the .json file does not exist, and it must exist for a Modex output to be successful. As a result, this output will not be considered in the detection process.')
 
-    detect_dll_proxying_across_several_memory_dumps(modex_detection_attempts, output_directory, logger)
+    detect_dll_hijacking_across_several_memory_dumps(modex_detection_attempts, output_directory, logger)
 
 
 def perform_mixture(modex_outputs_directory: str, perform_derelocation: bool, sum_path: str, dump_anomalies: bool,
@@ -306,7 +306,7 @@ def validate_arguments() -> Dict[str, Any]:
                             help='directory where the memory dumps are (the Modex plugin will be called)')
     arg_parser.add_argument('--detect',
                             action='store_true',
-                            help='detect the presence of the DLL proxying technique')
+                            help='detect the presence of the DLL hijacking technique')
     arg_parser.add_argument('-l',
                             '--log-level',
                             choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
