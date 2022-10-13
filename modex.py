@@ -325,6 +325,9 @@ def detect_dll_hijacking_inside_one_memory_dump(modules: List[Module], output_di
 
     detection_info['suspicious_processes'] = suspicious_processes
 
+    for mapped_module_info in mapped_modules_info:
+        mapped_module_info['base_address'] = hex(mapped_module_info['base_address'])
+
     files_generated: List[str] = []
     detection_info_path: str = os.path.join(output_directory, get_detection_information_filename())
     with open(detection_info_path, 'w') as detection_info_file:
