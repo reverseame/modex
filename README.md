@@ -95,4 +95,4 @@ In addition to extracting a module as complete as possible, *Modex* and *InterMo
 
 # License
 
-*Modex* and *InterModex* are licensed under the GNU General Public License v3.0
+Licensed under the [GNU GPLv3](LICENSE) license.
