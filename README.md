@@ -2,6 +2,8 @@
 
 *Modex* is a *Volatility 3* plugin to extract a module as complete as possible from a Windows 10 memory dump. To do that, the plugin collects all the pages of a particular module that are mapped in each process and then performs a mixture to obtain a single file which contains as many pages as possible.
 
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+
 ## Installation
 
 In order to run the plugin, [Python 3](https://www.python.org/downloads/) (version 3.9 or greater) and [Volatility 3](https://github.com/volatilityfoundation/volatility3) have to be installed on the machine where *Modex* is going to be used. Also, the following Python packages have to be installed: *py-tlsh*, *tabulate*. Additionally, the *Modex* plugin depends on the *SimplePteEnumerator* plugin (file named *simple_pteenum.py* that can be found [here](https://github.com/f-block/volatility-plugins)). The *SimplePteEnumerator* plugin allows *Modex* to know which pages are mapped in a given range inside the private address space of a process, and to differentiate between private and shared pages.
@@ -92,7 +94,5 @@ Additionally, for *InterModex* to work, the *python3* command has to be a valid 
 In addition to extracting a module as complete as possible, *Modex* and *InterModex* can also be used to detect the *DLL hijacking* technique. For that, the *--detect* option must be supplied. When this option is provided, the output is a directory that contains a JSON file and a text file. The JSON file contains information about the detection, and the text file is a log file with details about the execution.
 
 # License
-
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 
 *Modex* and *InterModex* are licensed under the GNU General Public License v3.0
